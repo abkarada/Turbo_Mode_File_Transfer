@@ -1,0 +1,18 @@
+# Test dosyaları
+test_*.bin
+*.bin
+
+# Derleme dosyaları
+*.class
+
+# Log dosyaları
+*.log
+
+# IDE dosyaları
+.vscode/
+.idea/
+*.iml
+
+# OS dosyaları
+.DS_Store
+Thumbs.db
