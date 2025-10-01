@@ -28,7 +28,7 @@ public class FileTransferSender {
 	    public static final long TURBO_MAX  = 256L << 20; // 256 MB
 	    public static final int  SLICE_SIZE = 1200;
 	    public static final int  MAX_TRY    = 4;
-	    public static final int  BACKOFF_NS = 200_000;
+	    public static final int  BACKOFF_NS = 50_000; // 50μs - daha hızlı
 	
 	    public FileTransferSender(DatagramChannel ch){
 		this.channel = ch;
@@ -104,55 +104,29 @@ public class FileTransferSender {
 	        ByteBuffer[] frame = new ByteBuffer[]{ pkt.headerBuffer(), payload.position(0).limit(take) };
 		
 	        int wrote;
+	        int retries = 0;
+	        final int MAX_RETRIES = 3; // Maksimum 3 deneme
+	        
 			try{
 	        do {
 	        	wrote = (int)channel.write(frame);
 	        	if(wrote == 0) {
+	        		retries++;
+	        		if(retries >= MAX_RETRIES) {
+	        			// Çok deneme yapıldı - retransmission'a bırak
+	        			break;
+	        		}
 	        		pkt.resetForRetry();
 	        		payload.position(0).limit(take);
-	        		LockSupport.parkNanos(BACKOFF_NS);
+	        		LockSupport.parkNanos(50_000); // 50μs - daha hızlı backoff
 	        	}
-	        } while(wrote == 0);
+	        } while(wrote == 0 && retries < MAX_RETRIES);
 			}catch(IOException e){
-				System.err.println("Frame sending error: + " + e);
+				throw e; // IO hatalarını yukarı fırlat
 			}
-	    	
 	    }
 	    
-	    // SMART BURST MODE - daha kontrollü gönderim
-	    public void sendOneBurst(CRC32C crc, CRC32C_Packet pkt,
-                MappedByteBuffer mem, long fileId,
-                int seqNo, int totalSeq, int take, int off) throws IOException{
-	    	
-	    	ByteBuffer payload = mem.slice(off, take);
-	    	crc.reset();
-	    	crc.update(payload.duplicate());
-	    	int crc32c = (int) crc.getValue();
-	    	
-	    	pkt.fillHeader(fileId, seqNo, totalSeq, take, crc32c);
-	    	
-	        ByteBuffer[] frame = new ByteBuffer[]{ pkt.headerBuffer(), payload.position(0).limit(take) };
-		
-	        // 2 deneme yap, sonra exception fırlat
-	        int attempts = 0;
-	        while(attempts < 2) {
-	        	try {
-	        		int written = (int)channel.write(frame);
-	        		if(written > 0) return; // Başarılı
-	        		attempts++;
-	        		if(attempts < 2) {
-	        			LockSupport.parkNanos(10_000); // 10μs bekle
-	        			// Frame'i reset et
-	        			pkt.resetForRetry();
-	        			payload.position(0).limit(take);
-	        		}
-	        	} catch(IOException e) {
-	        		attempts++;
-	        		if(attempts >= 2) throw e; // Son deneme başarısız
-	        		LockSupport.parkNanos(100_000); // 100μs bekle
-	        	}
-	        }
-	    }
+
 	    
 	    public void sendFile(Path filePath, long fileId) throws IOException{
 	    	if(channel == null) throw new IllegalStateException("Datagram Channel is null you must bind and connect first");
@@ -251,51 +225,33 @@ public class FileTransferSender {
 		retransmissionThread.setDaemon(true);
 		retransmissionThread.start();	
 		
-		// Initial transmission - SMART BURST MODE
-		System.out.println("Starting initial transmission with smart burst mode...");
-		long burstStart = System.currentTimeMillis();
+		// Initial transmission - OPTIMIZED ONE-BY-ONE
+		System.out.println("Starting initial transmission (optimized)...");
+		long transmissionStart = System.currentTimeMillis();
 		
 		int seqNo = 0;
-		int burstSize = 50; // Daha küçük burst - 50 paket
-		int burstCount = 0;
 		int successCount = 0;
-		int failCount = 0;
 		
 	    	for(int off = 0; off < mem.capacity(); ){
 	    		int remaining = mem.capacity() - off;
 	    		int take  = Math.min(SLICE_SIZE, remaining);
 	    		
 	    		try {
-	                sendOneBurst(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
 	                successCount++;
 	            } catch(IOException e) {
-	            	failCount++;
-	            	// Network congestion - yavaşla
-	            	if(failCount > 10) {
-	            		LockSupport.parkNanos(10_000_000); // 10ms bekle
-	            		failCount = 0;
-	            	}
+	            	System.err.println("Initial transmission error for seq " + seqNo + ": " + e.getMessage());
 	            }
 	                
 	                off += take;
 	                seqNo++;
-	                burstCount++;
-	                
-	                // Adaptive burst control
-	                if(burstCount >= burstSize) {
-	                	// Network durumuna göre bekle
-	                	if(failCount > 5) {
-	                		LockSupport.parkNanos(5_000_000); // 5ms - ağır traffic
-	                	} else {
-	                		LockSupport.parkNanos(500_000); // 0.5ms - normal
-	                	}
-	                	burstCount = 0;
-	                }
 	    	}
 	    	
-	    	long burstEnd = System.currentTimeMillis();
-	    	System.out.printf("Smart burst completed in %.2f seconds (%.0f packets/sec, success: %d, fails: %d)%n", 
-	    		(burstEnd - burstStart) / 1000.0, seqNo * 1000.0 / (burstEnd - burstStart), successCount, failCount);
+	    	long transmissionEnd = System.currentTimeMillis();
+	    	System.out.printf("Initial transmission completed in %.2f seconds (%.0f packets/sec, success: %d/%d)%n", 
+	    		(transmissionEnd - transmissionStart) / 1000.0, 
+	    		seqNo * 1000.0 / (transmissionEnd - transmissionStart), 
+	    		successCount, seqNo);
 	    	
 	    	initialTransmissionDone[0] = true;
 	    	System.out.println("Initial transmission completed, retransmissions continue...");
