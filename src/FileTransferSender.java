@@ -119,7 +119,7 @@ public class FileTransferSender {
 	    	
 	    }
 	    
-	    // BURST MODE - yazma başarısızlığında beklemeden devam et
+	    // SMART BURST MODE - daha kontrollü gönderim
 	    public void sendOneBurst(CRC32C crc, CRC32C_Packet pkt,
                 MappedByteBuffer mem, long fileId,
                 int seqNo, int totalSeq, int take, int off) throws IOException{
@@ -133,12 +133,25 @@ public class FileTransferSender {
 	    	
 	        ByteBuffer[] frame = new ByteBuffer[]{ pkt.headerBuffer(), payload.position(0).limit(take) };
 		
-			try{
-				// Burst mode - bir kez dene, başarısız olursa retransmission'a bırak
-				channel.write(frame);
-			}catch(IOException e){
-				System.err.println("Burst frame sending error: + " + e);
-			}
+	        // 2 deneme yap, sonra exception fırlat
+	        int attempts = 0;
+	        while(attempts < 2) {
+	        	try {
+	        		int written = (int)channel.write(frame);
+	        		if(written > 0) return; // Başarılı
+	        		attempts++;
+	        		if(attempts < 2) {
+	        			LockSupport.parkNanos(10_000); // 10μs bekle
+	        			// Frame'i reset et
+	        			pkt.resetForRetry();
+	        			payload.position(0).limit(take);
+	        		}
+	        	} catch(IOException e) {
+	        		attempts++;
+	        		if(attempts >= 2) throw e; // Son deneme başarısız
+	        		LockSupport.parkNanos(100_000); // 100μs bekle
+	        	}
+	        }
 	    }
 	    
 	    public void sendFile(Path filePath, long fileId) throws IOException{
@@ -212,7 +225,6 @@ public class FileTransferSender {
 				while(!Thread.currentThread().isInterrupted() && !stopRequested){
 	    			Integer miss = retxQueue.poll();
 	    			if(miss == null) {
-	    				// Eğer initial transmission bitti ve queue boşsa, biraz bekle
 	    				if(initialTransmissionDone[0]) {
 	    					LockSupport.parkNanos(1_000_000); // 1ms bekle
 	    					continue;
@@ -239,34 +251,51 @@ public class FileTransferSender {
 		retransmissionThread.setDaemon(true);
 		retransmissionThread.start();	
 		
-		// Initial transmission - BURST MODE ile tüm paketleri gönder
-		System.out.println("Starting initial transmission with burst mode...");
+		// Initial transmission - SMART BURST MODE
+		System.out.println("Starting initial transmission with smart burst mode...");
 		long burstStart = System.currentTimeMillis();
 		
 		int seqNo = 0;
-		int burstSize = 100; // 100 paket burst'ü
+		int burstSize = 50; // Daha küçük burst - 50 paket
 		int burstCount = 0;
+		int successCount = 0;
+		int failCount = 0;
 		
 	    	for(int off = 0; off < mem.capacity(); ){
 	    		int remaining = mem.capacity() - off;
 	    		int take  = Math.min(SLICE_SIZE, remaining);
 	    		
+	    		try {
 	                sendOneBurst(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+	                successCount++;
+	            } catch(IOException e) {
+	            	failCount++;
+	            	// Network congestion - yavaşla
+	            	if(failCount > 10) {
+	            		LockSupport.parkNanos(10_000_000); // 10ms bekle
+	            		failCount = 0;
+	            	}
+	            }
 	                
 	                off += take;
 	                seqNo++;
 	                burstCount++;
 	                
-	                // Burst kontrol - her 100 pakette kısa nefes al
+	                // Adaptive burst control
 	                if(burstCount >= burstSize) {
-	                	LockSupport.parkNanos(100_000); // 0.1ms nefes
+	                	// Network durumuna göre bekle
+	                	if(failCount > 5) {
+	                		LockSupport.parkNanos(5_000_000); // 5ms - ağır traffic
+	                	} else {
+	                		LockSupport.parkNanos(500_000); // 0.5ms - normal
+	                	}
 	                	burstCount = 0;
 	                }
 	    	}
 	    	
 	    	long burstEnd = System.currentTimeMillis();
-	    	System.out.printf("Burst transmission completed in %.2f seconds (%.0f packets/sec)%n", 
-	    		(burstEnd - burstStart) / 1000.0, seqNo * 1000.0 / (burstEnd - burstStart));
+	    	System.out.printf("Smart burst completed in %.2f seconds (%.0f packets/sec, success: %d, fails: %d)%n", 
+	    		(burstEnd - burstStart) / 1000.0, seqNo * 1000.0 / (burstEnd - burstStart), successCount, failCount);
 	    	
 	    	initialTransmissionDone[0] = true;
 	    	System.out.println("Initial transmission completed, retransmissions continue...");
