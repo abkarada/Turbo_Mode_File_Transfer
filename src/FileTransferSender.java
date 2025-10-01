@@ -28,7 +28,7 @@ public class FileTransferSender {
 	    public static final long TURBO_MAX  = 256L << 20; // 256 MB
 	    public static final int  SLICE_SIZE = 1200;
 	    public static final int  MAX_TRY    = 4;
-	    public static final int  BACKOFF_NS = 50_000; // 50μs - daha hızlı
+	    public static final int  BACKOFF_NS = 200_000;
 	
 	    public FileTransferSender(DatagramChannel ch){
 		this.channel = ch;
@@ -104,29 +104,69 @@ public class FileTransferSender {
 	        ByteBuffer[] frame = new ByteBuffer[]{ pkt.headerBuffer(), payload.position(0).limit(take) };
 		
 	        int wrote;
-	        int retries = 0;
-	        final int MAX_RETRIES = 3; // Maksimum 3 deneme
-	        
 			try{
 	        do {
 	        	wrote = (int)channel.write(frame);
 	        	if(wrote == 0) {
-	        		retries++;
-	        		if(retries >= MAX_RETRIES) {
-	        			// Çok deneme yapıldı - retransmission'a bırak
-	        			break;
-	        		}
 	        		pkt.resetForRetry();
 	        		payload.position(0).limit(take);
-	        		LockSupport.parkNanos(50_000); // 50μs - daha hızlı backoff
+	        		LockSupport.parkNanos(BACKOFF_NS);
 	        	}
-	        } while(wrote == 0 && retries < MAX_RETRIES);
+	        } while(wrote == 0);
 			}catch(IOException e){
-				throw e; // IO hatalarını yukarı fırlat
+				System.err.println("Frame sending error: + " + e);
 			}
+	    	
 	    }
 	    
-
+	    // Batch sending - sendmmsg tarzı optimizasyon
+	    private static final int BATCH_SIZE = 32; // Batch'te kaç paket
+	    
+	    public void sendBatch(CRC32C crc, CRC32C_Packet pkt, MappedByteBuffer mem, 
+	                         long fileId, int startSeq, int totalSeq, int batchCount) throws IOException {
+	        
+	        // Batch için buffer array'i hazırla
+	        ByteBuffer[] batchBuffers = new ByteBuffer[batchCount * 2]; // Her paket için header + payload
+	        
+	        int bufferIndex = 0;
+	        for(int i = 0; i < batchCount; i++) {
+	            int seqNo = startSeq + i;
+	            int off = seqNo * SLICE_SIZE;
+	            
+	            if(off >= mem.capacity()) break; // Dosya sonu
+	            
+	            int remaining = mem.capacity() - off;
+	            int take = Math.min(SLICE_SIZE, remaining);
+	            
+	            // Payload slice
+	            ByteBuffer payload = mem.slice(off, take);
+	            
+	            // CRC hesapla
+	            crc.reset();
+	            crc.update(payload.duplicate());
+	            int crc32c = (int) crc.getValue();
+	            
+	            // Header hazırla
+	            pkt.fillHeader(fileId, seqNo, totalSeq, take, crc32c);
+	            
+	            // Batch array'e ekle
+	            batchBuffers[bufferIndex++] = pkt.headerBuffer().duplicate();
+	            batchBuffers[bufferIndex++] = payload.duplicate();
+	        }
+	        
+	        // Batch'i tek seferde gönder (gathering write)
+	        long totalWritten = 0;
+	        int attempts = 0;
+	        do {
+	            long written = channel.write(batchBuffers, 0, bufferIndex);
+	            totalWritten += written;
+	            attempts++;
+	            
+	            if(written == 0 && attempts < 3) {
+	                LockSupport.parkNanos(1_000); // 1μs minimal backoff
+	            }
+	        } while(totalWritten == 0 && attempts < 3);
+	    }
 	    
 	    public void sendFile(Path filePath, long fileId) throws IOException{
 	    	if(channel == null) throw new IllegalStateException("Datagram Channel is null you must bind and connect first");
@@ -199,6 +239,7 @@ public class FileTransferSender {
 				while(!Thread.currentThread().isInterrupted() && !stopRequested){
 	    			Integer miss = retxQueue.poll();
 	    			if(miss == null) {
+	    				// Eğer initial transmission bitti ve queue boşsa, biraz bekle
 	    				if(initialTransmissionDone[0]) {
 	    					LockSupport.parkNanos(1_000_000); // 1ms bekle
 	    					continue;
@@ -225,33 +266,30 @@ public class FileTransferSender {
 		retransmissionThread.setDaemon(true);
 		retransmissionThread.start();	
 		
-		// Initial transmission - OPTIMIZED ONE-BY-ONE
-		System.out.println("Starting initial transmission (optimized)...");
-		long transmissionStart = System.currentTimeMillis();
-		
+		// Initial transmission - batch halinde gönder
+		System.out.println("Starting initial transmission with batching...");
 		int seqNo = 0;
-		int successCount = 0;
-		
-	    	for(int off = 0; off < mem.capacity(); ){
-	    		int remaining = mem.capacity() - off;
-	    		int take  = Math.min(SLICE_SIZE, remaining);
-	    		
-	    		try {
-	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
-	                successCount++;
-	            } catch(IOException e) {
-	            	System.err.println("Initial transmission error for seq " + seqNo + ": " + e.getMessage());
-	            }
-	                
-	                off += take;
-	                seqNo++;
-	    	}
-	    	
-	    	long transmissionEnd = System.currentTimeMillis();
-	    	System.out.printf("Initial transmission completed in %.2f seconds (%.0f packets/sec, success: %d/%d)%n", 
-	    		(transmissionEnd - transmissionStart) / 1000.0, 
-	    		seqNo * 1000.0 / (transmissionEnd - transmissionStart), 
-	    		successCount, seqNo);
+		while(seqNo < totalSeq) {
+			int batchCount = Math.min(BATCH_SIZE, totalSeq - seqNo);
+			try {
+				sendBatch(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, batchCount);
+				seqNo += batchCount;
+			} catch(IOException e) {
+				System.err.println("Batch send error at seq " + seqNo + ": " + e);
+				// Fallback to single packet
+				for(int i = 0; i < batchCount && seqNo < totalSeq; i++) {
+					int off = seqNo * SLICE_SIZE;
+					int remaining = mem.capacity() - off;
+					int take = Math.min(SLICE_SIZE, remaining);
+					try {
+						sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+					} catch(IOException e2) {
+						System.err.println("Single packet fallback failed at seq " + seqNo + ": " + e2);
+					}
+					seqNo++;
+				}
+			}
+		}
 	    	
 	    	initialTransmissionDone[0] = true;
 	    	System.out.println("Initial transmission completed, retransmissions continue...");

@@ -236,7 +236,7 @@ public class NackSender implements Runnable{
 	{
 		if(nackHandle == null || nackHandle.isCancelled() || nackHandle.isDone())
 		{
-		  nackHandle = scheduler.scheduleAtFixedRate(nack_service, 0 , 5, TimeUnit.MILLISECONDS); // Çok hızlı NACK gönderimi
+		  nackHandle = scheduler.scheduleAtFixedRate(nack_service, 0 , 25, TimeUnit.MILLISECONDS); // Daha hızlı NACK gönderimi
 		}
 	}
 	public void stopNackLoop(){

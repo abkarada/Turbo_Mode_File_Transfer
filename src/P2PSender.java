@@ -78,16 +78,20 @@ public class P2PSender {
             // Channel setup with optimized buffers
             senderChannel = DatagramChannel.open();
             
-            // Socket buffer boyutlarını artır (performance)
+            // Socket buffer boyutlarını artır (kernel buffers)
             senderChannel.setOption(StandardSocketOptions.SO_SNDBUF, 2 * 1024 * 1024); // 2MB send buffer
-            senderChannel.setOption(StandardSocketOptions.SO_RCVBUF, 512 * 1024); // 512KB receive buffer
+            senderChannel.setOption(StandardSocketOptions.SO_RCVBUF, 1 * 1024 * 1024); // 1MB receive buffer
             
             InetSocketAddress bindAddress = new InetSocketAddress(bindPort);
             senderChannel.bind(bindAddress);
             
             // Actual bind port'u al (0 seçildiyse otomatik port alınır)
             int actualBindPort = ((InetSocketAddress) senderChannel.getLocalAddress()).getPort();
+            int sendBuf = senderChannel.getOption(StandardSocketOptions.SO_SNDBUF);
+            int recvBuf = senderChannel.getOption(StandardSocketOptions.SO_RCVBUF);
+            
             System.out.println("✅ Socket başarıyla bind edildi - Port: " + actualBindPort);
+            System.out.println("📊 Send Buffer: " + (sendBuf/1024) + "KB, Receive Buffer: " + (recvBuf/1024) + "KB");
             
             // Target'a connect
             InetSocketAddress targetAddress = new InetSocketAddress(targetIp, targetPort);

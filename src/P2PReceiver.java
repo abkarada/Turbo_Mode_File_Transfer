@@ -58,14 +58,18 @@ public class P2PReceiver {
             // Channel setup with optimized buffers
             receiverChannel = DatagramChannel.open();
             
-            // Socket buffer boyutlarını artır (performance)
-            receiverChannel.setOption(StandardSocketOptions.SO_RCVBUF, 2 * 1024 * 1024); // 2MB receive buffer
-            receiverChannel.setOption(StandardSocketOptions.SO_SNDBUF, 512 * 1024); // 512KB send buffer
+            // Socket buffer boyutlarını artır (kernel buffers)
+            receiverChannel.setOption(StandardSocketOptions.SO_RCVBUF, 4 * 1024 * 1024); // 4MB receive buffer
+            receiverChannel.setOption(StandardSocketOptions.SO_SNDBUF, 1 * 1024 * 1024); // 1MB send buffer
             
             InetSocketAddress bindAddress = new InetSocketAddress(bindIp, bindPort);
             receiverChannel.bind(bindAddress);
             
+            int sendBuf = receiverChannel.getOption(StandardSocketOptions.SO_SNDBUF);
+            int recvBuf = receiverChannel.getOption(StandardSocketOptions.SO_RCVBUF);
+            
             System.out.println("✅ Socket başarıyla bind edildi: " + bindAddress);
+            System.out.println("📊 Send Buffer: " + (sendBuf/1024) + "KB, Receive Buffer: " + (recvBuf/1024) + "KB");
             System.out.println("🔵 Sender'dan bağlantı bekleniyor...");
             System.out.println("🔵 Handshake için maksimum 60 saniye beklenecek...");
             System.out.println("");
