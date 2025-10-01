@@ -105,22 +105,23 @@ public class FileTransferSender {
 		
 	        int wrote;
 			try{
-	        do {
-	        	wrote = (int)channel.write(frame);
-	        	if(wrote == 0) {
-	        		pkt.resetForRetry();
-	        		payload.position(0).limit(take);
-	        		LockSupport.parkNanos(BACKOFF_NS);
-	        	}
-	        } while(wrote == 0);
+	        wrote = (int)channel.write(frame);
+	        if(wrote == 0) {
+	        	// Buffer dolu - hemen geri dön, retry yok
+	        	throw new IOException("Send buffer full");
+	        }
 			}catch(IOException e){
 				System.err.println("Frame sending error: + " + e);
 			}
 	    	
 	    }
 	    
-	    // Batch sending - sendmmsg tarzı optimizasyon
-	    private static final int BATCH_SIZE = 32; // Batch'te kaç paket
+	    // Adaptive batch sending with congestion control
+	    private static final int MIN_BATCH_SIZE = 4;   // Minimum batch size
+	    private static final int MAX_BATCH_SIZE = 16;  // Maximum batch size  
+	    private volatile int currentBatchSize = MIN_BATCH_SIZE; // Adaptive batch size
+	    private volatile int inflightPackets = 0;      // In-flight paket sayısı
+	    private static final int MAX_INFLIGHT = 64;    // Maximum in-flight packets
 	    
 	    public void sendBatch(CRC32C crc, CRC32C_Packet pkt, MappedByteBuffer mem, 
 	                         long fileId, int startSeq, int totalSeq, int batchCount) throws IOException {
@@ -266,29 +267,49 @@ public class FileTransferSender {
 		retransmissionThread.setDaemon(true);
 		retransmissionThread.start();	
 		
-		// Initial transmission - batch halinde gönder
-		System.out.println("Starting initial transmission with batching...");
+		// Initial transmission - rate-limited single packets (congestion aware)
+		System.out.println("Starting initial transmission with congestion control...");
 		int seqNo = 0;
-		while(seqNo < totalSeq) {
-			int batchCount = Math.min(BATCH_SIZE, totalSeq - seqNo);
-			try {
-				sendBatch(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, batchCount);
-				seqNo += batchCount;
-			} catch(IOException e) {
-				System.err.println("Batch send error at seq " + seqNo + ": " + e);
-				// Fallback to single packet
-				for(int i = 0; i < batchCount && seqNo < totalSeq; i++) {
-					int off = seqNo * SLICE_SIZE;
-					int remaining = mem.capacity() - off;
-					int take = Math.min(SLICE_SIZE, remaining);
-					try {
-						sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
-					} catch(IOException e2) {
-						System.err.println("Single packet fallback failed at seq " + seqNo + ": " + e2);
-					}
-					seqNo++;
-				}
+		long packetInterval = 10_000; // 10μs başlangıç interval
+		long lastSendTime = System.nanoTime();
+		
+		for(int off = 0; off < mem.capacity(); ){
+			// In-flight packet limit kontrolü
+			while(inflightPackets >= MAX_INFLIGHT) {
+				LockSupport.parkNanos(1_000_000); // 1ms bekle
 			}
+			
+			int remaining = mem.capacity() - off;
+			int take = Math.min(SLICE_SIZE, remaining);
+			
+			try {
+				// Rate limiting - paketler arası minimum interval
+				long now = System.nanoTime();
+				long elapsed = now - lastSendTime;
+				if(elapsed < packetInterval) {
+					LockSupport.parkNanos(packetInterval - elapsed);
+				}
+				
+				sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+				inflightPackets++;
+				lastSendTime = System.nanoTime();
+				
+				// Adaptive rate adjustment
+				if(seqNo % 100 == 0) { // Her 100 pakette bir ayarla
+					if(inflightPackets < MAX_INFLIGHT / 2) {
+						packetInterval = Math.max(1_000, packetInterval - 1_000); // Hızlandır
+					} else if(inflightPackets > MAX_INFLIGHT * 3/4) {
+						packetInterval = Math.min(100_000, packetInterval + 2_000); // Yavaşlat
+					}
+				}
+				
+			} catch(IOException e) {
+				System.err.println("Send error at seq " + seqNo + ": " + e);
+				packetInterval = Math.min(100_000, packetInterval * 2); // Hata durumunda yavaşlat
+			}
+			
+			off += take;
+			seqNo++;
 		}
 	    	
 	    	initialTransmissionDone[0] = true;
