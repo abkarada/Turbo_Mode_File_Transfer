@@ -78,7 +78,7 @@ public class P2PSender {
             // Channel setup with optimized buffers
             senderChannel = DatagramChannel.open();
             
-            // Socket buffer boyutlarını artır (kernel buffers) - daha büyük
+            // Socket buffer boyutlarını artır (kernel buffers)
             senderChannel.setOption(StandardSocketOptions.SO_SNDBUF, 8 * 1024 * 1024); // 8MB send buffer
             senderChannel.setOption(StandardSocketOptions.SO_RCVBUF, 2 * 1024 * 1024); // 2MB receive buffer
             

@@ -58,8 +58,8 @@ public class P2PReceiver {
             // Channel setup with optimized buffers
             receiverChannel = DatagramChannel.open();
             
-            // Socket buffer boyutlarını artır (kernel buffers) - daha büyük
-            receiverChannel.setOption(StandardSocketOptions.SO_RCVBUF, 16 * 1024 * 1024); // 16MB receive buffer
+            // Socket buffer boyutlarını artır (kernel buffers)
+            receiverChannel.setOption(StandardSocketOptions.SO_RCVBUF, 8 * 1024 * 1024); // 8MB receive buffer
             receiverChannel.setOption(StandardSocketOptions.SO_SNDBUF, 2 * 1024 * 1024); // 2MB send buffer
             
             InetSocketAddress bindAddress = new InetSocketAddress(bindIp, bindPort);
