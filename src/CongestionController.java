@@ -76,30 +76,29 @@ public class CongestionController {
         totalAcksReceived.addAndGet(numAckedPackets);
         
         if (slowStartPhase) {
-            // Slow start: exponential increase
-            congestionWindowSize += numAckedPackets;
+            // Aggressive slow start: double exponential increase
+            congestionWindowSize += numAckedPackets * 2; // 2x daha hızlı artış
             
-            // Exit slow start when window gets large
-            if (congestionWindowSize > 256) {
+            // Exit slow start much earlier for faster ramp-up
+            if (congestionWindowSize > 64) { // 256'dan 64'e düşürdük
                 slowStartPhase = false;
-                // Switch to rate-based control
-                if (packetArrivalRate > 0) {
-                    packetSendingPeriodNs = 1_000_000_000L / packetArrivalRate;
-                }
-                System.out.println("🚀 Exiting slow start, window: " + (int)congestionWindowSize + ", rate: " + packetArrivalRate + " pps");
+                // Start with higher rate
+                packetSendingPeriodNs = 2_000; // 2μs (500k pps)
+                packetArrivalRate = 500_000; // 500k pps varsayım
+                System.out.println("🚀 Exiting aggressive slow start, window: " + (int)congestionWindowSize + ", rate: " + packetArrivalRate + " pps");
             }
         } else {
-            // Congestion avoidance: linear increase
-            congestionWindowSize += 1.0 / congestionWindowSize;
+            // Aggressive congestion avoidance: faster increase
+            congestionWindowSize += 2.0 / congestionWindowSize; // 2x daha hızlı
             
             if (!recentLoss) {
-                // Increase sending rate gradually
-                double increaseRatio = 1.001; // 0.1% increase
+                // Increase sending rate more aggressively
+                double increaseRatio = 1.01; // 1% increase (10x daha agresif)
                 packetSendingPeriodNs = (long)(packetSendingPeriodNs / increaseRatio);
                 
-                // Lower bound
-                if (packetSendingPeriodNs < 1_000) { // Minimum 1μs
-                    packetSendingPeriodNs = 1_000;
+                // Lower bound - daha agresif minimum
+                if (packetSendingPeriodNs < 500) { // Minimum 0.5μs (2M pps)
+                    packetSendingPeriodNs = 500;
                 }
             }
         }
@@ -212,8 +211,10 @@ public class CongestionController {
      * Enable aggressive mode for local networks
      */
     public void enableAggressiveMode() {
-        congestionWindowSize = 512;
-        packetSendingPeriodNs = 5_000; // 5μs
-        System.out.println("⚡ Aggressive mode enabled for high-speed local network");
+        congestionWindowSize = 2048; // 4x daha büyük pencere
+        packetSendingPeriodNs = 1_000; // 1μs (1M pps)
+        packetArrivalRate = 1_000_000; // 1M pps varsayım
+        slowStartPhase = false; // SlowStart'ı atla
+        System.out.println("⚡ ULTRA Aggressive mode enabled - Window: " + (int)congestionWindowSize + ", Rate: 1M pps");
     }
 }

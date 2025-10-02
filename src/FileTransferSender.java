@@ -274,8 +274,8 @@ public class FileTransferSender {
 		this.retransmissionThread.setDaemon(true);
 		this.retransmissionThread.start();	
 		
-		// Batch sender for high-throughput
-		BatchSender batchSender = new BatchSender(channel, 64); // 64 packet batches
+		// Batch sender for maximum throughput
+		BatchSender batchSender = new BatchSender(channel, 128); // 128 packet batches
 		
 			    	// Ana thread optimizasyonu
 	    	SystemOptimizer.optimizeNetworkThread("main-sender");
@@ -286,13 +286,21 @@ public class FileTransferSender {
 		int batchCount = 0;
 		
 	    	for(int off = 0; off < mem.capacity(); ){
-	    		// Congestion window kontrolü
-	    		while (!congestionControl.canSendPacket()) {
-	    			LockSupport.parkNanos(1_000); // 1μs bekle
+	    		// Congestion window kontrolü - daha az sıklıkta
+	    		if (seqNo % 16 == 0) { // Her 16 pakette bir kontrol et
+	    			while (!congestionControl.canSendPacket()) {
+	    				LockSupport.parkNanos(100); // 0.1μs bekle
+	    			}
 	    		}
 	    		
 	    		int remaining = mem.capacity() - off;
 	    		int take  = Math.min(SLICE_SIZE, remaining);
+	    		
+	    		// Memory prefetch - sonraki paketleri önceden cache'e al
+	    		if (seqNo % 64 == 0 && off + (64 * SLICE_SIZE) < mem.capacity()) {
+	    			ByteBuffer prefetch = mem.slice(off, Math.min(64 * SLICE_SIZE, mem.capacity() - off));
+	    			prefetch.get(0); // Cache'e çek
+	    		}
 	    		
 	    		// Packet hazırla
 	    		ByteBuffer packet = preparePacket(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
@@ -305,8 +313,8 @@ public class FileTransferSender {
 	    				congestionControl.onPacketSent(); // Batch sent bildirimi  
 	    				batchCount++;
 	    				
-	    				// Rate limiting sadece batch sonunda
-	    				if (batchCount % 4 == 0) { // Her 4 batch'te bir
+	    				// Rate limiting çok daha az
+	    				if (batchCount % 16 == 0) { // Her 16 batch'te bir
 	    					congestionControl.rateLimitSend();
 	    				}
 	    			} catch(IOException e) {
