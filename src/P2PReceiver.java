@@ -59,10 +59,22 @@ public class P2PReceiver {
             InetSocketAddress bindAddress = new InetSocketAddress(bindIp, bindPort);
             receiverChannel.bind(bindAddress);
             
+            // Socket buffer optimizasyonları
+            try {
+                receiverChannel.socket().setReceiveBufferSize(8 * 1024 * 1024); // 8MB receive buffer
+                receiverChannel.socket().setSendBufferSize(8 * 1024 * 1024); // 8MB send buffer
+                System.out.println("📡 Socket buffers set to 8MB each");
+            } catch(Exception e) {
+                System.err.println("⚠️  Could not set socket buffers: " + e.getMessage());
+            }
+            
             System.out.println("✅ Socket başarıyla bind edildi: " + bindAddress);
             System.out.println("🔵 Sender'dan bağlantı bekleniyor...");
             System.out.println("🔵 Handshake için maksimum 60 saniye beklenecek...");
             System.out.println("");
+            
+            // Sistem optimizasyonu
+            SystemOptimizer.optimizeNetworkThread("main-receiver");
             
             // FileTransferReceiver kullan
             FileTransferReceiver receiver = new FileTransferReceiver();

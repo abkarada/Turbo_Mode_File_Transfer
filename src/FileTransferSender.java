@@ -132,12 +132,22 @@ public class FileTransferSender {
 	    	Thread nackThread = null;
 	    	Thread retransmissionThread = null;
 	    	
+	    	// Socket buffer optimizasyonları
+	    	try {
+	    		channel.socket().setSendBufferSize(8 * 1024 * 1024); // 8MB send buffer
+	    		channel.socket().setReceiveBufferSize(8 * 1024 * 1024); // 8MB receive buffer
+	    		System.out.println("📡 Socket buffers set to 8MB each");
+	    	} catch(Exception e) {
+	    		System.err.println("⚠️  Could not set socket buffers: " + e.getMessage());
+	    	}
+	    	
 	    	try(FileChannel fc = FileChannel.open(filePath, StandardOpenOption.READ)){
 	    		long fileSize = fc.size();
 	    		if(fileSize > TURBO_MAX) throw new IllegalArgumentException("Turbo Mode is only for  ≤256 MB.");
 	    		
 	    		MappedByteBuffer mem = fc.map(FileChannel.MapMode.READ_ONLY, 0, fileSize);
 	    		for(int i = 0; i < MAX_TRY && !mem.isLoaded(); i++) mem.load();
+	    		System.out.println("🗂️  Memory-mapped file loaded (" + (fileSize / (1024*1024)) + " MB)");
 	    		
 	    		int totalSeq = (int) ((fileSize + SLICE_SIZE - 1) / SLICE_SIZE);
 	    		
@@ -180,7 +190,10 @@ public class FileTransferSender {
 	    		transferCompleteLatch.countDown();
 	    	};
 	    	
-	    	 this.nackThread = new Thread(nackListener, "nack-listener");
+	    	 this.nackThread = new Thread(() -> {
+	    	 	SystemOptimizer.optimizeNetworkThread("nack-listener");
+	    	 	nackListener.run();
+	    	 }, "nack-listener");
 	    	 if (this.nackThread == null) {
 	    	 	System.err.println("❌ NackThread creation failed!");
 	    	 	return;
@@ -198,12 +211,13 @@ public class FileTransferSender {
 	    		congestionControl.enableAggressiveMode();
 	    	}
 	    	
-	    	// Statistics display thread
+	    	// Statistics display thread with optimization
 	    	this.statsThread = new Thread(() -> {
+	    		SystemOptimizer.optimizeCurrentThread("stats-display");
 	    		while (!Thread.currentThread().isInterrupted()) {
 	    			try {
 	    				Thread.sleep(2000); // Her 2 saniyede bir stats göster
-	    				System.out.println("📊 " + congestionControl.getStats());
+	    				System.out.println("📊 " + congestionControl.getStats() + " | " + SystemOptimizer.getSystemStatus());
 	    			} catch (InterruptedException e) {
 	    				break;
 	    			}
@@ -260,33 +274,66 @@ public class FileTransferSender {
 		this.retransmissionThread.setDaemon(true);
 		this.retransmissionThread.start();	
 		
-		// Initial transmission - congestion control ile kontrollü gönderim
-		System.out.println("Starting congestion-controlled transmission...");
+		// Batch sender for high-throughput
+		BatchSender batchSender = new BatchSender(channel, 64); // 64 packet batches
+		
+			    	// Ana thread optimizasyonu
+	    	SystemOptimizer.optimizeNetworkThread("main-sender");
+	    	
+		// Initial transmission thread'inde de optimizasyon
+		System.out.println("Starting batch-controlled high-speed transmission...");
 		int seqNo = 0;
+		int batchCount = 0;
+		
 	    	for(int off = 0; off < mem.capacity(); ){
 	    		// Congestion window kontrolü
 	    		while (!congestionControl.canSendPacket()) {
-	    			LockSupport.parkNanos(10_000); // 10μs bekle
+	    			LockSupport.parkNanos(1_000); // 1μs bekle
 	    		}
-	    		
-	    		// Rate limiting
-	    		congestionControl.rateLimitSend();
 	    		
 	    		int remaining = mem.capacity() - off;
 	    		int take  = Math.min(SLICE_SIZE, remaining);
 	    		
-	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
-	                congestionControl.onPacketSent(); // Packet sent bildirimi
+	    		// Packet hazırla
+	    		ByteBuffer packet = preparePacket(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+	    		
+	    		// Batch'e ekle
+	    		if (!batchSender.addToBatch(packet)) {
+	    			// Batch dolu - gönder
+	    			try {
+	    				int sent = batchSender.sendBatch();
+	    				congestionControl.onPacketSent(); // Batch sent bildirimi  
+	    				batchCount++;
+	    				
+	    				// Rate limiting sadece batch sonunda
+	    				if (batchCount % 4 == 0) { // Her 4 batch'te bir
+	    					congestionControl.rateLimitSend();
+	    				}
+	    			} catch(IOException e) {
+	    				System.err.println("Batch send error: " + e);
+	    			}
+	    			
+	    			// Şu anki paketi yeni batch'e ekle
+	    			batchSender.addToBatch(packet);
+	    		}
 	                
 	                off += take;
 	                seqNo++;
 	                
-	                // Her 100 pakette bir progress göster
-	                if (seqNo % 100 == 0) {
+	                // Her 500 pakette bir progress göster
+	                if (seqNo % 500 == 0) {
 	                	double progress = (double)off / mem.capacity() * 100;
-	                	System.out.printf("📤 Progress: %.1f%% (%d/%d packets) - %s\n", 
-	                		progress, seqNo, totalSeq, congestionControl.getStats());
+	                	System.out.printf("� Progress: %.1f%% (%d/%d packets) - %s | %s\n", 
+	                		progress, seqNo, totalSeq, congestionControl.getStats(), batchSender.getStats());
 	                }
+	    	}
+	    	
+	    	// Son batch'i gönder
+	    	try {
+	    		batchSender.flushBatch();
+	    		System.out.println("📦 Final batch flushed");
+	    	} catch(IOException e) {
+	    		System.err.println("Final batch flush error: " + e);
 	    	}
 	    	
 	    	initialTransmissionDone[0] = true;
@@ -329,6 +376,29 @@ public class FileTransferSender {
 	    			statsThread.interrupt();
 	    		}
 	    	}
+	    }
+	    
+	    /**
+	     * Prepare packet for batching (without sending)
+	     */
+	    public ByteBuffer preparePacket(CRC32C crc, CRC32C_Packet pkt,
+                MappedByteBuffer mem, long fileId,
+                int seqNo, int totalSeq, int take, int off) {
+	    	
+	    	ByteBuffer payload = mem.slice(off, take);
+	    	crc.reset();
+	    	crc.update(payload.duplicate());
+	    	int crc32c = (int) crc.getValue();
+	    	
+	    	pkt.fillHeader(fileId, seqNo, totalSeq, take, crc32c);
+	    	
+	    	// Single buffer with header + payload
+	    	ByteBuffer combined = ByteBuffer.allocateDirect(22 + take);
+	    	combined.put(pkt.headerBuffer().duplicate());
+	    	combined.put(payload.position(0).limit(take));
+	    	combined.flip();
+	    	
+	    	return combined;
 	    }
 	    
 	    public static void shutdownThreadPool() {
