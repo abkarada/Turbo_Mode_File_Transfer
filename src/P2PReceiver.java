@@ -1,6 +1,5 @@
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.StandardSocketOptions;
 import java.nio.channels.DatagramChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -55,21 +54,12 @@ public class P2PReceiver {
             System.out.println("🔵 Output File: " + outputFile);
             System.out.println("");
             
-            // Channel setup with optimized buffers
+            // Channel setup
             receiverChannel = DatagramChannel.open();
-            
-            // Socket buffer boyutlarını artır (kernel buffers)
-            receiverChannel.setOption(StandardSocketOptions.SO_RCVBUF, 8 * 1024 * 1024); // 8MB receive buffer
-            receiverChannel.setOption(StandardSocketOptions.SO_SNDBUF, 2 * 1024 * 1024); // 2MB send buffer
-            
             InetSocketAddress bindAddress = new InetSocketAddress(bindIp, bindPort);
             receiverChannel.bind(bindAddress);
             
-            int sendBuf = receiverChannel.getOption(StandardSocketOptions.SO_SNDBUF);
-            int recvBuf = receiverChannel.getOption(StandardSocketOptions.SO_RCVBUF);
-            
             System.out.println("✅ Socket başarıyla bind edildi: " + bindAddress);
-            System.out.println("📊 Send Buffer: " + (sendBuf/1024) + "KB, Receive Buffer: " + (recvBuf/1024) + "KB");
             System.out.println("🔵 Sender'dan bağlantı bekleniyor...");
             System.out.println("🔵 Handshake için maksimum 60 saniye beklenecek...");
             System.out.println("");

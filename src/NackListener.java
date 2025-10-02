@@ -14,6 +14,9 @@ public class NackListener implements Runnable{
 	// Completion callback
 	public volatile Runnable onTransferComplete = null;
 	
+	// Congestion control reference
+	public volatile CongestionController congestionControl = null;
+	
     public static final int DEFAULT_BACKOFF_NS = 200_000;
 
 	public NackListener(DatagramChannel channel,
@@ -108,6 +111,8 @@ public class NackListener implements Runnable{
 				}
 				
 				// 64-bit mask'teki her bit için kontrol et
+				int lossCount = 0;
+				int ackCount = 0;
 				for(int i = 0; i < 64; i++){
 					int seq = base + i;
 					if(seq >= totalSeq) break; // Son paketten sonrası için dur
@@ -120,7 +125,20 @@ public class NackListener implements Runnable{
 							if(!added) {
 								System.err.println("Failed to add seq " + seq + " to retransmission queue");
 							}
+							lossCount++;
 						}
+					} else {
+						ackCount++;
+					}
+				}
+				
+				// Congestion control feedback
+				if(congestionControl != null) {
+					if(ackCount > 0) {
+						congestionControl.onPacketAcked(ackCount);
+					}
+					if(lossCount > 0) {
+						congestionControl.onPacketLoss(lossCount);
 					}
 				}
 				

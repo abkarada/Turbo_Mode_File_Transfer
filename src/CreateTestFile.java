@@ -4,17 +4,17 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 
 /**
- * Test dosyası oluşturucu
- * Kullanım: java CreateTestFile <file_name> <size_mb>
+ * Test File Maker 
+ * Usage: java CreateTestFile <file_name> <size_mb>
  */
 public class CreateTestFile {
     
     public static void main(String[] args) {
         if (args.length < 2) {
-            System.out.println("=== Test Dosyası Oluşturucu ===");
+            System.out.println("=== Test File Maker ===");
             System.out.println("Kullanım: java CreateTestFile <file_name> <size_mb>");
             System.out.println("");
-            System.out.println("Örnekler:");
+            System.out.println("Examples:");
             System.out.println("  java CreateTestFile test_1mb.txt 1");
             System.out.println("  java CreateTestFile test_10mb.txt 10");
             System.out.println("  java CreateTestFile big_file.txt 50");
@@ -27,12 +27,12 @@ public class CreateTestFile {
         try {
             sizeMB = Integer.parseInt(args[1]);
         } catch (NumberFormatException e) {
-            System.err.println("❌ Hata: Boyut geçersiz: " + args[1]);
+            System.err.println("❌ Error: Size is Exceptional: " + args[1]);
             return;
         }
         
         if (sizeMB < 1 || sizeMB > 256) {
-            System.err.println("❌ Hata: Boyut 1-256 MB arasında olmalı");
+            System.err.println("❌ Error: Size MUST BE  in 1-256 MB range ");
             return;
         }
         

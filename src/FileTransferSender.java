@@ -17,6 +17,12 @@ import java.util.zip.CRC32C;
 public class FileTransferSender {
 	    private final DatagramChannel channel;
 	    private volatile boolean stopRequested = false;
+	    
+	    // Congestion control and threads
+	    private CongestionController congestionControl;
+	    private Thread statsThread;
+	    private Thread nackThread;
+	    private Thread retransmissionThread;
 	    private static final ExecutorService threadPool = 
 	        Executors.newCachedThreadPool(r -> {
 	            Thread t = new Thread(r);
@@ -119,64 +125,6 @@ public class FileTransferSender {
 	    	
 	    }
 	    
-	    // Adaptive batch sending with flow control
-	    private static final int MIN_BATCH_SIZE = 4;
-	    private static final int MAX_BATCH_SIZE = 16; // Daha küçük batch
-	    private volatile int currentBatchSize = MIN_BATCH_SIZE;
-	    private volatile int inFlightPackets = 0;
-	    private static final int MAX_IN_FLIGHT = 64; // Congestion window
-	    
-	    // NACK callback - in-flight tracking için
-	    public void onPacketAcknowledged(int count) {
-	        inFlightPackets = Math.max(0, inFlightPackets - count);
-	    }
-	    
-	    public void sendBatch(CRC32C crc, CRC32C_Packet pkt, MappedByteBuffer mem, 
-	                         long fileId, int startSeq, int totalSeq, int batchCount) throws IOException {
-	        
-	        // Batch için buffer array'i hazırla
-	        ByteBuffer[] batchBuffers = new ByteBuffer[batchCount * 2]; // Her paket için header + payload
-	        
-	        int bufferIndex = 0;
-	        for(int i = 0; i < batchCount; i++) {
-	            int seqNo = startSeq + i;
-	            int off = seqNo * SLICE_SIZE;
-	            
-	            if(off >= mem.capacity()) break; // Dosya sonu
-	            
-	            int remaining = mem.capacity() - off;
-	            int take = Math.min(SLICE_SIZE, remaining);
-	            
-	            // Payload slice
-	            ByteBuffer payload = mem.slice(off, take);
-	            
-	            // CRC hesapla
-	            crc.reset();
-	            crc.update(payload.duplicate());
-	            int crc32c = (int) crc.getValue();
-	            
-	            // Header hazırla
-	            pkt.fillHeader(fileId, seqNo, totalSeq, take, crc32c);
-	            
-	            // Batch array'e ekle
-	            batchBuffers[bufferIndex++] = pkt.headerBuffer().duplicate();
-	            batchBuffers[bufferIndex++] = payload.duplicate();
-	        }
-	        
-	        // Batch'i tek seferde gönder (gathering write)
-	        long totalWritten = 0;
-	        int attempts = 0;
-	        do {
-	            long written = channel.write(batchBuffers, 0, bufferIndex);
-	            totalWritten += written;
-	            attempts++;
-	            
-	            if(written == 0 && attempts < 3) {
-	                LockSupport.parkNanos(1_000); // 1μs minimal backoff
-	            }
-	        } while(totalWritten == 0 && attempts < 3);
-	    }
-	    
 	    public void sendFile(Path filePath, long fileId) throws IOException{
 	    	if(channel == null) throw new IllegalStateException("Datagram Channel is null you must bind and connect first");
 	    	if(stopRequested) throw new IllegalStateException("Transfer was stopped");
@@ -224,6 +172,7 @@ public class FileTransferSender {
 	    	 
 	    	// NACK listener'ı başlat
 	    	NackListener nackListener = new NackListener(channel, fileId, totalSeq, retxQueue, BACKOFF_NS);
+	    	nackListener.congestionControl = congestionControl; // Congestion control referansını ekle
 	    	
 	    	// Completion callback ayarla
 	    	nackListener.onTransferComplete = () -> {
@@ -231,9 +180,33 @@ public class FileTransferSender {
 	    		transferCompleteLatch.countDown();
 	    	};
 	    	
-	    	 nackThread = new Thread(nackListener, "nack-listener");
+	    	 this.nackThread = new Thread(nackListener, "nack-listener");
 	    	 nackThread.setDaemon(true);
 	    	 nackThread.start();
+	    	
+	    	// Congestion control ekleme
+	    	this.congestionControl = new CongestionController();
+	    	
+	    	// Local network için aggressive mode aktif et
+	    	String targetHost = channel.socket().getRemoteSocketAddress().toString();
+	    	if (targetHost.contains("127.0.0.1") || targetHost.contains("localhost") || 
+	    	    targetHost.contains("192.168.") || targetHost.contains("10.")) {
+	    		congestionControl.enableAggressiveMode();
+	    	}
+	    	
+	    	// Statistics display thread
+	    	this.statsThread = new Thread(() -> {
+	    		while (!Thread.currentThread().isInterrupted()) {
+	    			try {
+	    				Thread.sleep(2000); // Her 2 saniyede bir stats göster
+	    				System.out.println("📊 " + congestionControl.getStats());
+	    			} catch (InterruptedException e) {
+	    				break;
+	    			}
+	    		}
+	    	}, "congestion-stats");
+	    	statsThread.setDaemon(true);
+	    	statsThread.start();
 	    	
 	    	// UDT tarzı concurrent transmission - retransmission ve initial transmission aynı anda
 	    	FileTransferSender sender = this;
@@ -241,7 +214,7 @@ public class FileTransferSender {
 	    	
 	    	// Retransmission thread - sürekli çalışır
 			// Retransmission thread - kendi CRC ve packet instance'ları ile
-		retransmissionThread = new Thread( () -> {
+		this.retransmissionThread = new Thread( () -> {
 				CRC32C retxCrc = new CRC32C();
 				CRC32C_Packet retxPkt = new CRC32C_Packet();
 				
@@ -275,63 +248,34 @@ public class FileTransferSender {
 		retransmissionThread.setDaemon(true);
 		retransmissionThread.start();	
 		
-		// Initial transmission - flow control ile
-		System.out.println("Starting initial transmission with flow control...");
+		// Initial transmission - congestion control ile kontrollü gönderim
+		System.out.println("Starting congestion-controlled transmission...");
 		int seqNo = 0;
-		int consecutiveErrors = 0;
-		
-		while(seqNo < totalSeq) {
-			// Congestion window kontrolü
-			while(inFlightPackets >= MAX_IN_FLIGHT) {
-				LockSupport.parkNanos(10_000); // 10μs bekle
-			}
-			
-			int batchCount = Math.min(currentBatchSize, totalSeq - seqNo);
-			batchCount = Math.min(batchCount, MAX_IN_FLIGHT - inFlightPackets);
-			
-			if(batchCount <= 0) {
-				LockSupport.parkNanos(1_000); 
-				continue;
-			}
-			
-			try {
-				sendBatch(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, batchCount);
-				inFlightPackets += batchCount;
-				seqNo += batchCount;
-				consecutiveErrors = 0;
-				
-				// Adaptive batch size - başarılı ise artır
-				if(currentBatchSize < MAX_BATCH_SIZE) {
-					currentBatchSize++;
-				}
-				
-			} catch(IOException e) {
-				consecutiveErrors++;
-				System.err.println("Batch send error at seq " + seqNo + " (error #" + consecutiveErrors + "): " + e.getMessage());
-				
-				// Congestion control - batch size'ı azalt
-				currentBatchSize = Math.max(MIN_BATCH_SIZE, currentBatchSize / 2);
-				
-				if(consecutiveErrors >= 10) {
-					System.err.println("Too many consecutive errors, pausing...");
-					LockSupport.parkNanos(10_000_000); // 10ms pause
-					consecutiveErrors = 0;
-				}
-				
-				// Fallback to single packet
-				int off = seqNo * SLICE_SIZE;
-				int remaining = mem.capacity() - off;
-				int take = Math.min(SLICE_SIZE, remaining);
-				try {
-					sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
-					inFlightPackets++;
-					seqNo++;
-				} catch(IOException e2) {
-					System.err.println("Single packet fallback failed at seq " + seqNo + ": " + e2.getMessage());
-					seqNo++; // Skip problematic packet
-				}
-			}
-		}
+	    	for(int off = 0; off < mem.capacity(); ){
+	    		// Congestion window kontrolü
+	    		while (!congestionControl.canSendPacket()) {
+	    			LockSupport.parkNanos(10_000); // 10μs bekle
+	    		}
+	    		
+	    		// Rate limiting
+	    		congestionControl.rateLimitSend();
+	    		
+	    		int remaining = mem.capacity() - off;
+	    		int take  = Math.min(SLICE_SIZE, remaining);
+	    		
+	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+	                congestionControl.onPacketSent(); // Packet sent bildirimi
+	                
+	                off += take;
+	                seqNo++;
+	                
+	                // Her 100 pakette bir progress göster
+	                if (seqNo % 100 == 0) {
+	                	double progress = (double)off / mem.capacity() * 100;
+	                	System.out.printf("📤 Progress: %.1f%% (%d/%d packets) - %s\n", 
+	                		progress, seqNo, totalSeq, congestionControl.getStats());
+	                }
+	    	}
 	    	
 	    	initialTransmissionDone[0] = true;
 	    	System.out.println("Initial transmission completed, retransmissions continue...");
@@ -366,6 +310,11 @@ public class FileTransferSender {
 	    			} catch (InterruptedException e) {
 	    				Thread.currentThread().interrupt();
 	    			}
+	    		}
+	    		
+	    		// Stats thread cleanup
+	    		if(statsThread != null && statsThread.isAlive()) {
+	    			statsThread.interrupt();
 	    		}
 	    	}
 	    }
