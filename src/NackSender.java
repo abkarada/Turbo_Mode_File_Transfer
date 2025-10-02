@@ -275,10 +275,15 @@ public class NackSender implements Runnable{
 			while(!Thread.currentThread().isInterrupted() && !transferCompleted){
 				buf.clear();
 
-				int x;
+				int x = 0; // Initialize x
 				do{
 					try{
 					x = channel.read(buf);
+					}catch(java.net.PortUnreachableException e){
+						System.err.println("⚠️  Sender port unreachable - connection may be closed: " + e.getMessage());
+						LockSupport.parkNanos(10_000_000); // 10ms bekle ve tekrar dene
+						x = 0; // Reset x for retry
+						continue;
 					}catch(IOException e){
 						System.err.println("read failed: " + e);
 						return ;

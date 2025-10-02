@@ -181,8 +181,12 @@ public class FileTransferSender {
 	    	};
 	    	
 	    	 this.nackThread = new Thread(nackListener, "nack-listener");
-	    	 nackThread.setDaemon(true);
-	    	 nackThread.start();
+	    	 if (this.nackThread == null) {
+	    	 	System.err.println("❌ NackThread creation failed!");
+	    	 	return;
+	    	 }
+	    	 this.nackThread.setDaemon(true);
+	    	 this.nackThread.start();
 	    	
 	    	// Congestion control ekleme
 	    	this.congestionControl = new CongestionController();
@@ -205,8 +209,12 @@ public class FileTransferSender {
 	    			}
 	    		}
 	    	}, "congestion-stats");
-	    	statsThread.setDaemon(true);
-	    	statsThread.start();
+	    	if (this.statsThread == null) {
+	    		System.err.println("❌ StatsThread creation failed!");
+	    		return;
+	    	}
+	    	this.statsThread.setDaemon(true);
+	    	this.statsThread.start();
 	    	
 	    	// UDT tarzı concurrent transmission - retransmission ve initial transmission aynı anda
 	    	FileTransferSender sender = this;
@@ -245,8 +253,12 @@ public class FileTransferSender {
 					}}
     			}
 	}, "retransmission-thread");
-		retransmissionThread.setDaemon(true);
-		retransmissionThread.start();	
+		if (this.retransmissionThread == null) {
+			System.err.println("❌ RetransmissionThread creation failed!");
+			return;
+		}
+		this.retransmissionThread.setDaemon(true);
+		this.retransmissionThread.start();	
 		
 		// Initial transmission - congestion control ile kontrollü gönderim
 		System.out.println("Starting congestion-controlled transmission...");
