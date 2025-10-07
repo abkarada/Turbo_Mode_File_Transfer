@@ -34,7 +34,7 @@ public class NackSender implements Runnable{
 	public volatile int cum_Ack = 0;
 	private volatile boolean transferCompleted = false;
 	public final int CRC32C_HEADER_SIZE = 22;
-	public final int PAYLOAD_SIZE = 1200;
+	public final int PAYLOAD_SIZE = 1450; // Updated to match FileTransferSender
 	public final int TOTAL_PACKET_SIZE = CRC32C_HEADER_SIZE + PAYLOAD_SIZE;
 
     	public static final int OFF_FILE_ID  = 0;

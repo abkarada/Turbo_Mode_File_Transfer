@@ -94,7 +94,7 @@ public class SimpleUnitTests {
             long fileId = 98765L;
             int seqNo = 5;
             int totalSeq = 100;
-            int payloadLen = 1200;
+            int payloadLen = 1450; // Updated packet size
             int crc32c = 0x12345678;
             
             packet.fillHeader(fileId, seqNo, totalSeq, payloadLen, crc32c);
