@@ -18,8 +18,8 @@ public class FileTransferSender {
 	    private final DatagramChannel channel;
 	    private volatile boolean stopRequested = false;
 	    
-	    // Congestion control and threads
-	    private CongestionController congestionControl;
+	    // Simple congestion control
+	    private SimpleCongestionController simpleControl;
 	    private Thread statsThread;
 	    private Thread nackThread;
 	    private Thread retransmissionThread;
@@ -172,7 +172,7 @@ public class FileTransferSender {
 	    	 
 	    	// NACK listener'ı başlat
 	    	NackListener nackListener = new NackListener(channel, fileId, totalSeq, retxQueue, BACKOFF_NS);
-	    	nackListener.congestionControl = congestionControl; // Congestion control referansını ekle
+	    	nackListener.simpleControl = simpleControl; // Simple control referansını ekle
 	    	
 	    	// Completion callback ayarla
 	    	nackListener.onTransferComplete = () -> {
@@ -188,27 +188,29 @@ public class FileTransferSender {
 	    	 this.nackThread.setDaemon(true);
 	    	 this.nackThread.start();
 	    	
-	    	// Congestion control ekleme
-	    	this.congestionControl = new CongestionController();
+	    	// Basit congestion control
+	    	this.simpleControl = new SimpleCongestionController();
 	    	
-	    	// Local network için aggressive mode aktif et
+	    	// Network türüne göre optimize et
 	    	String targetHost = channel.socket().getRemoteSocketAddress().toString();
 	    	if (targetHost.contains("127.0.0.1") || targetHost.contains("localhost") || 
 	    	    targetHost.contains("192.168.") || targetHost.contains("10.")) {
-	    		congestionControl.enableAggressiveMode();
+	    		simpleControl.enableLocalNetworkMode();
+	    	} else {
+	    		simpleControl.enableNormalMode();
 	    	}
 	    	
 	    	// Statistics display thread
 	    	this.statsThread = new Thread(() -> {
 	    		while (!Thread.currentThread().isInterrupted()) {
 	    			try {
-	    				Thread.sleep(2000); // Her 2 saniyede bir stats göster
-	    				System.out.println("📊 " + congestionControl.getStats());
+	    				Thread.sleep(3000); // Her 3 saniyede bir stats göster
+	    				System.out.println("📊 " + simpleControl.getStats());
 	    			} catch (InterruptedException e) {
 	    				break;
 	    			}
 	    		}
-	    	}, "congestion-stats");
+	    	}, "simple-stats");
 	    	if (this.statsThread == null) {
 	    		System.err.println("❌ StatsThread creation failed!");
 	    		return;
@@ -260,37 +262,34 @@ public class FileTransferSender {
 		this.retransmissionThread.setDaemon(true);
 		this.retransmissionThread.start();	
 		
-		// SLIDING WINDOW - sürekli akışkan gönderim
-		System.out.println("Starting sliding window transmission...");
+		// BASIT SIRALI GÖNDERİM - karmaşık window kontrolü yok!
+		System.out.println("Starting simple sequential transmission...");
 		int seqNo = 0;
-		long lastProgressTime = System.currentTimeMillis();
+		long startTime = System.currentTimeMillis();
+		long lastProgressTime = startTime;
 		
 	    	for(int off = 0; off < mem.capacity(); ){
-	    		// Soft congestion window check - hard blocking değil
-	    		if (congestionControl.canSendPacket()) {
-		    		// Rate pacing - küçük adımlarla
-		    		congestionControl.rateLimitSend();
-		    		
-		    		int remaining = mem.capacity() - off;
-		    		int take  = Math.min(SLICE_SIZE, remaining);
-		    		
-		                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
-		                congestionControl.onPacketSent(); // Packet sent bildirimi
-		                
-		                off += take;
-		                seqNo++;
-		                
-		                // Her 2 saniyede bir progress göster (daha az spam)
-		                if (System.currentTimeMillis() - lastProgressTime > 2000) {
-		                	double progress = (double)off / mem.capacity() * 100;
-		                	System.out.printf("📤 Progress: %.1f%% (%d/%d packets) - %s\n", 
-		                		progress, seqNo, totalSeq, congestionControl.getStats());
-		                	lastProgressTime = System.currentTimeMillis();
-		                }
-	    		} else {
-	    			// Window dolu - kısa bekle, hard block etme
-	    			LockSupport.parkNanos(100_000); // 100μs bekle - çok kısa
-	    		}
+	    		// Basit rate limiting - window kontrolü yok
+	    		simpleControl.rateLimitSend();
+	    		
+	    		int remaining = mem.capacity() - off;
+	    		int take  = Math.min(SLICE_SIZE, remaining);
+	    		
+	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+	                simpleControl.onPacketSent();
+	                
+	                off += take;
+	                seqNo++;
+	                
+	                // Her 1 saniyede progress ve throughput göster
+	                if (System.currentTimeMillis() - lastProgressTime > 1000) {
+	                	double progress = (double)off / mem.capacity() * 100;
+	                	long elapsed = System.currentTimeMillis() - startTime;
+	                	double throughputMbps = (off * 8.0) / (elapsed * 1000.0); // Mbps
+	                	System.out.printf("📤 Progress: %.1f%%, Throughput: %.1f Mbps - %s\n", 
+	                		progress, throughputMbps, simpleControl.getStats());
+	                	lastProgressTime = System.currentTimeMillis();
+	                }
 	    	}
 	    	
 	    	initialTransmissionDone[0] = true;

@@ -16,6 +16,7 @@ public class NackListener implements Runnable{
 	
 	// Congestion control reference
 	public volatile CongestionController congestionControl = null;
+	public volatile SimpleCongestionController simpleControl = null;
 	
     public static final int DEFAULT_BACKOFF_NS = 200_000;
 
@@ -132,13 +133,13 @@ public class NackListener implements Runnable{
 					}
 				}
 				
-				// Congestion control feedback
-				if(congestionControl != null) {
+				// Simple congestion control feedback
+				if(simpleControl != null) {
 					if(ackCount > 0) {
-						congestionControl.onPacketAcked(ackCount);
+						simpleControl.onSuccess(); // Successful packets
 					}
 					if(lossCount > 0) {
-						congestionControl.onPacketLoss(lossCount);
+						simpleControl.onPacketLoss(lossCount); // Loss detection
 					}
 				}
 				
