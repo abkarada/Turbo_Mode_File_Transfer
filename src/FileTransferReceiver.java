@@ -21,7 +21,7 @@ public class FileTransferReceiver {
 	public Path filePath;
 	public MappedByteBuffer mem_buf;
 	public static final long MAX_FILE_SIZE = 256L << 20;
-	public static final int SLICE_SIZE = 8192; // 8KB paketler - daha az packet, daha yüksek throughput!
+	public static final int SLICE_SIZE = 1450; // Maximum payload without fragmentation
 	public static final int HEADER_SIZE = 22;
 	public static final int PACKET_SIZE = SLICE_SIZE + HEADER_SIZE;
 	
