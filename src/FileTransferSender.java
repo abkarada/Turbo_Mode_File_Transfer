@@ -34,7 +34,7 @@ public class FileTransferSender {
 	    public static final long TURBO_MAX  = 256L << 20; // 256 MB
 	    public static final int  SLICE_SIZE = 1200;
 	    public static final int  MAX_TRY    = 4;
-	    public static final int  BACKOFF_NS = 200_000;
+	    public static final int  BACKOFF_NS = 10_000; // 10μs - çok daha az bekleme
 	
 	    public FileTransferSender(DatagramChannel ch){
 		this.channel = ch;
@@ -260,33 +260,37 @@ public class FileTransferSender {
 		this.retransmissionThread.setDaemon(true);
 		this.retransmissionThread.start();	
 		
-		// Initial transmission - congestion control ile kontrollü gönderim
-		System.out.println("Starting congestion-controlled transmission...");
+		// SLIDING WINDOW - sürekli akışkan gönderim
+		System.out.println("Starting sliding window transmission...");
 		int seqNo = 0;
+		long lastProgressTime = System.currentTimeMillis();
+		
 	    	for(int off = 0; off < mem.capacity(); ){
-	    		// Congestion window kontrolü
-	    		while (!congestionControl.canSendPacket()) {
-	    			LockSupport.parkNanos(10_000); // 10μs bekle
+	    		// Soft congestion window check - hard blocking değil
+	    		if (congestionControl.canSendPacket()) {
+		    		// Rate pacing - küçük adımlarla
+		    		congestionControl.rateLimitSend();
+		    		
+		    		int remaining = mem.capacity() - off;
+		    		int take  = Math.min(SLICE_SIZE, remaining);
+		    		
+		                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+		                congestionControl.onPacketSent(); // Packet sent bildirimi
+		                
+		                off += take;
+		                seqNo++;
+		                
+		                // Her 2 saniyede bir progress göster (daha az spam)
+		                if (System.currentTimeMillis() - lastProgressTime > 2000) {
+		                	double progress = (double)off / mem.capacity() * 100;
+		                	System.out.printf("📤 Progress: %.1f%% (%d/%d packets) - %s\n", 
+		                		progress, seqNo, totalSeq, congestionControl.getStats());
+		                	lastProgressTime = System.currentTimeMillis();
+		                }
+	    		} else {
+	    			// Window dolu - kısa bekle, hard block etme
+	    			LockSupport.parkNanos(100_000); // 100μs bekle - çok kısa
 	    		}
-	    		
-	    		// Rate limiting
-	    		congestionControl.rateLimitSend();
-	    		
-	    		int remaining = mem.capacity() - off;
-	    		int take  = Math.min(SLICE_SIZE, remaining);
-	    		
-	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
-	                congestionControl.onPacketSent(); // Packet sent bildirimi
-	                
-	                off += take;
-	                seqNo++;
-	                
-	                // Her 100 pakette bir progress göster
-	                if (seqNo % 100 == 0) {
-	                	double progress = (double)off / mem.capacity() * 100;
-	                	System.out.printf("📤 Progress: %.1f%% (%d/%d packets) - %s\n", 
-	                		progress, seqNo, totalSeq, congestionControl.getStats());
-	                }
 	    	}
 	    	
 	    	initialTransmissionDone[0] = true;

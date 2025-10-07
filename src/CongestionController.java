@@ -7,11 +7,11 @@ import java.util.concurrent.locks.LockSupport;
  */
 public class CongestionController {
     
-    // Congestion window size (in packets)
-    private volatile double congestionWindowSize = 32.0; // Başlangıç pencere boyutu
+    // Congestion window size (in packets) - Daha küçük, kontrollü başlangıç
+    private volatile double congestionWindowSize = 16.0; // Küçük başlangıç pencere boyutu
     
-    // Packet sending period in nanoseconds
-    private volatile long packetSendingPeriodNs = 50_000; // 50μs başlangıç
+    // Packet sending period in nanoseconds - Kontrollü başlangıç
+    private volatile long packetSendingPeriodNs = 25_000; // 25μs başlangıç = 40k pps
     
     // Round trip time in microseconds
     private volatile long roundTripTimeUs = 20_000; // 20ms varsayılan
@@ -36,8 +36,8 @@ public class CongestionController {
     private final AtomicLong totalPacketsSent = new AtomicLong(0);
     private final AtomicLong totalAcksReceived = new AtomicLong(0);
     
-    // Maximum in-flight packets (safety limit)
-    private static final int MAX_IN_FLIGHT = 2048;
+    // Maximum in-flight packets (safety limit) - Çok daha düşük
+    private static final int MAX_IN_FLIGHT = 256; // Ağ tıkanmasını önlemek için düşük tutalım
     
     public CongestionController() {
         // Initial conservative settings
@@ -79,27 +79,25 @@ public class CongestionController {
             // Slow start: exponential increase
             congestionWindowSize += numAckedPackets;
             
-            // Exit slow start when window gets large
-            if (congestionWindowSize > 256) {
+            // Exit slow start when window gets moderate - daha erken çık
+            if (congestionWindowSize > 64) {
                 slowStartPhase = false;
-                // Switch to rate-based control
-                if (packetArrivalRate > 0) {
-                    packetSendingPeriodNs = 1_000_000_000L / packetArrivalRate;
-                }
-                System.out.println("🚀 Exiting slow start, window: " + (int)congestionWindowSize + ", rate: " + packetArrivalRate + " pps");
+                // Kontrollü rate-based control
+                packetSendingPeriodNs = 10_000; // 10μs = 100k pps reasonable rate
+                System.out.println("🚀 Exiting slow start, window: " + (int)congestionWindowSize + ", switching to controlled rate");
             }
         } else {
-            // Congestion avoidance: linear increase
-            congestionWindowSize += 1.0 / congestionWindowSize;
+            // Smooth congestion avoidance: yavaş ve kontrollü artış
+            congestionWindowSize += 0.5 / congestionWindowSize; // Daha yavaş artış
             
             if (!recentLoss) {
-                // Increase sending rate gradually
-                double increaseRatio = 1.001; // 0.1% increase
+                // Çok az rate increase - stability için
+                double increaseRatio = 1.0001; // 0.01% increase - çok küçük adımlar
                 packetSendingPeriodNs = (long)(packetSendingPeriodNs / increaseRatio);
                 
-                // Lower bound
-                if (packetSendingPeriodNs < 1_000) { // Minimum 1μs
-                    packetSendingPeriodNs = 1_000;
+                // Reasonable lower bound - çok hızlı gitmesin
+                if (packetSendingPeriodNs < 5_000) { // Minimum 5μs = 200k pps max
+                    packetSendingPeriodNs = 5_000;
                 }
             }
         }
@@ -209,11 +207,12 @@ public class CongestionController {
     }
     
     /**
-     * Enable aggressive mode for local networks
+     * Enable smooth high-performance mode for local networks
      */
     public void enableAggressiveMode() {
-        congestionWindowSize = 512;
-        packetSendingPeriodNs = 5_000; // 5μs
-        System.out.println("⚡ Aggressive mode enabled for high-speed local network");
+        congestionWindowSize = 32; // Moderate başlangıç
+        packetSendingPeriodNs = 15_000; // 15μs = ~67k pps reasonable start
+        slowStartPhase = true; // Smooth scaling
+        System.out.println("⚡ SMOOTH mode enabled - Controlled high-performance flow");
     }
 }
