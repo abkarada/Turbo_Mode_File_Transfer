@@ -32,9 +32,9 @@ public class FileTransferSender {
 	        });
 
 	    public static final long TURBO_MAX  = 256L << 20; // 256 MB
-	    public static final int  SLICE_SIZE = 1200;
+	    public static final int  SLICE_SIZE = 8192; // 8KB paketler - çok daha büyük!
 	    public static final int  MAX_TRY    = 4;
-	    public static final int  BACKOFF_NS = 10_000; // 10μs - çok daha az bekleme
+	    public static final int  BACKOFF_NS = 0; // HİÇ BEKLEME YOK!
 	
 	    public FileTransferSender(DatagramChannel ch){
 		this.channel = ch;
@@ -109,18 +109,11 @@ public class FileTransferSender {
 	    	
 	        ByteBuffer[] frame = new ByteBuffer[]{ pkt.headerBuffer(), payload.position(0).limit(take) };
 		
-	        int wrote;
+	        // ULTRA FAST - retry loop yok, direkt gönder!
 			try{
-	        do {
-	        	wrote = (int)channel.write(frame);
-	        	if(wrote == 0) {
-	        		pkt.resetForRetry();
-	        		payload.position(0).limit(take);
-	        		LockSupport.parkNanos(BACKOFF_NS);
-	        	}
-	        } while(wrote == 0);
+	        	channel.write(frame); // Başarısız olursa bile devam et, retransmission halleder
 			}catch(IOException e){
-				System.err.println("Frame sending error: + " + e);
+				System.err.println("Frame sending error: " + e);
 			}
 	    	
 	    }

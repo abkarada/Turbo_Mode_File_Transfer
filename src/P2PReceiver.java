@@ -54,8 +54,13 @@ public class P2PReceiver {
             System.out.println("🔵 Output File: " + outputFile);
             System.out.println("");
             
-            // Channel setup
+            // Channel setup with optimized buffers
             receiverChannel = DatagramChannel.open();
+            
+            // ULTRA BÜYÜK UDP BUFFER'LAR - Maximum throughput için
+            receiverChannel.setOption(java.net.StandardSocketOptions.SO_SNDBUF, 8 * 1024 * 1024); // 8MB send buffer
+            receiverChannel.setOption(java.net.StandardSocketOptions.SO_RCVBUF, 8 * 1024 * 1024); // 8MB receive buffer
+            
             InetSocketAddress bindAddress = new InetSocketAddress(bindIp, bindPort);
             receiverChannel.bind(bindAddress);
             

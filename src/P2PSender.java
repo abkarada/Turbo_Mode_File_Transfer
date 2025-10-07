@@ -74,8 +74,13 @@ public class P2PSender {
             System.out.println("🟢 File Size: " + fileSize + " bytes (" + String.format("%.2f", fileSizeMB) + " MB)");
             System.out.println("");
             
-            // Channel setup
+            // Channel setup with optimized buffers
             senderChannel = DatagramChannel.open();
+            
+            // ULTRA BÜYÜK UDP BUFFER'LAR - Maximum throughput için
+            senderChannel.setOption(java.net.StandardSocketOptions.SO_SNDBUF, 8 * 1024 * 1024); // 8MB send buffer
+            senderChannel.setOption(java.net.StandardSocketOptions.SO_RCVBUF, 8 * 1024 * 1024); // 8MB receive buffer
+            
             InetSocketAddress bindAddress = new InetSocketAddress(bindPort);
             senderChannel.bind(bindAddress);
             
