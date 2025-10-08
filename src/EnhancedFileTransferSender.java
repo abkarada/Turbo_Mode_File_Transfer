@@ -204,13 +204,15 @@ public class EnhancedFileTransferSender {
 	    	
 	    	// Network türüne göre optimize et
 	    	String targetHost = channel.socket().getRemoteSocketAddress().toString();
-	    	if (targetHost.contains("127.0.0.1") || targetHost.contains("localhost") || 
-	    	    targetHost.contains("192.168.") || targetHost.contains("10.")) {
+	    	boolean isLocalNetwork = targetHost.contains("127.0.0.1") || targetHost.contains("localhost") || 
+	    	    targetHost.contains("192.168.") || targetHost.contains("10.");
+	    	    
+	    	if (isLocalNetwork) {
 	    		hybridControl.enableLocalNetworkMode();
 	    		System.out.println("🏠 Local network detected - enabling aggressive mode");
 	    	} else {
 	    		hybridControl.enableWanMode();
-	    		System.out.println("🌐 WAN detected - enabling conservative mode");
+	    		System.out.println("🌐 WAN detected - packet-by-packet conservative mode");
 	    	}
 	    	
 	    	// Enhanced statistics display thread
@@ -288,26 +290,27 @@ public class EnhancedFileTransferSender {
 		long lastProgressTime = startTime;
 		
 	    	for(int off = 0; off < mem.capacity(); ){
-	    		// QUIC-style congestion window control
-	    		if (hybridControl != null && !hybridControl.canSendPacket()) {
-	    			// Window is full, wait a bit
-	    			LockSupport.parkNanos(1_000); // 1μs - daha hızlı
-	    			continue;
-	    		}
-	    		
 	    		int remaining = mem.capacity() - off;
 	    		int take  = Math.min(SLICE_SIZE, remaining);
 	    		
+	    		// TEKER TEKER GÖNDERİM - Her paketten sonra küçük pause
 	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
+	                
+	                // WAN için packet pacing - network'ü tıkamayalım
+	                if (!isLocalNetwork) {
+	                	LockSupport.parkNanos(50_000); // 50μs bekle - WAN için
+	                } else {
+	                	LockSupport.parkNanos(1_000); // 1μs bekle - LAN için
+	                }
 	                
 	                off += take;
 	                seqNo++;
 	                
-	                // Enhanced progress display with congestion info
+	                // Enhanced progress display
 	                if (System.currentTimeMillis() - lastProgressTime > 1000) {
 	                	double progress = (double)off / mem.capacity() * 100;
 	                	long elapsed = System.currentTimeMillis() - startTime;
-	                	double throughputMbps = (off * 8.0) / (elapsed * 1000.0); // Mbps
+	                	double throughputMbps = (off * 8.0) / (elapsed * 1000.0);
 	                	System.out.printf("📤 Progress: %.1f%%, Throughput: %.1f Mbps\n", progress, throughputMbps);
 	                	System.out.println("🎯 " + hybridControl.getStats());
 	                	lastProgressTime = System.currentTimeMillis();
