@@ -329,8 +329,7 @@ public class HybridCongestionController {
     
     // Getters
     public long getCongestionWindow() { return congestionWindow; }
-    public long getBytesInFlight() { return bytesInFlight.get(); }
     public long getSmoothedRtt() { return smoothedRtt; }
-    public long getEstimatedBandwidth() { return estimatedBandwidthBps; }
+    public long getPacingInterval() { return packetIntervalNs; }
     public CongestionState getState() { return state; }
 }

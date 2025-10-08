@@ -86,7 +86,7 @@ public class EnhancedNackListener implements Runnable{
 					continue;
 				}
 				
-				// NACK Frame tam boyut kontrolü - sabit 20 byte olmalı
+				// NACK Frame tam boyut kontrolü - şimdi 28 byte (timestamp dahil)
 				if(r != NackFrame.SIZE) {
 					System.err.println("Invalid frame size: expected " + NackFrame.SIZE + " (NACK) or 8 (completion), received " + r + " bytes");
 					continue;
@@ -104,6 +104,19 @@ public class EnhancedNackListener implements Runnable{
 				if(fid != fileId) {
 					// Farklı dosya ID'si - sessizce atla
 					continue;
+				}
+				
+				// RTT MEASUREMENT - NACK timestamp'ini al ve RTT hesapla! 🎯
+				long nackSentTime = NackFrame.timestamp(ctrl);
+				long nackReceiveTime = System.nanoTime();
+				long rttNs = nackReceiveTime - nackSentTime;
+				
+				// RTT sanity check ve congestion control güncelle
+				if(rttNs > 50_000 && rttNs < 100_000_000) { // 50μs - 100ms arası
+					if(hybridControl != null) {
+						hybridControl.updateRtt(rttNs);
+						lastRttMeasurement = rttNs;
+					}
 				}
 				
 				int base = NackFrame.baseSeq(ctrl);

@@ -55,7 +55,6 @@ public class EnhancedFileTransferSender {
 		channel.write(pkt.get_header().duplicate());
 		ByteBuffer buffer = ByteBuffer.allocateDirect(HandShake_Packet.HEADER_SIZE).order(ByteOrder.BIG_ENDIAN);
 		
-		// Handshake ACK için timeout ekle (5 saniye)
 		long ackDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
 		int r;
 		
@@ -190,7 +189,7 @@ public class EnhancedFileTransferSender {
 	    	
 	    	 this.nackThread = new Thread(enhancedNackListener, "enhanced-nack-listener");
 	    	 if (this.nackThread == null) {
-	    	 	System.err.println("❌ Enhanced NackThread creation failed!");
+	    	 	System.err.println("Enhanced NackThread creation failed!");
 	    	 	return;
 	    	 }
 	    	 this.nackThread.setDaemon(true);
@@ -209,10 +208,10 @@ public class EnhancedFileTransferSender {
 	    	    
 	    	if (isLocalNetwork) {
 	    		hybridControl.enableLocalNetworkMode();
-	    		System.out.println("🏠 Local network detected - enabling aggressive mode");
+	    		System.out.println(" Local network detected - enabling aggressive mode");
 	    	} else {
 	    		hybridControl.enableWanMode();
-	    		System.out.println("🌐 WAN detected - packet-by-packet conservative mode");
+	    		System.out.println(" WAN detected - packet-by-packet conservative mode");
 	    	}
 	    	
 	    	// Enhanced statistics display thread
@@ -220,15 +219,15 @@ public class EnhancedFileTransferSender {
 	    		while (!Thread.currentThread().isInterrupted()) {
 	    			try {
 	    				Thread.sleep(2000); // Her 2 saniyede bir stats göster
-	    				System.out.println("📊 " + hybridControl.getStats());
-	    				System.out.println("🔄 " + enhancedNackListener.getRttStats());
+	    				System.out.println(" " + hybridControl.getStats());
+	    				System.out.println(" " + enhancedNackListener.getRttStats());
 	    			} catch (InterruptedException e) {
 	    				break;
 	    			}
 	    		}
 	    	}, "enhanced-stats");
 	    	if (this.statsThread == null) {
-	    		System.err.println("❌ Enhanced StatsThread creation failed!");
+	    		System.err.println("Enhanced StatsThread creation failed!");
 	    		return;
 	    	}
 	    	this.statsThread.setDaemon(true);
@@ -277,14 +276,14 @@ public class EnhancedFileTransferSender {
     		}
 	}, "enhanced-retransmission");
 		if (this.retransmissionThread == null) {
-			System.err.println("❌ Enhanced RetransmissionThread creation failed!");
+			System.err.println(" Enhanced RetransmissionThread creation failed!");
 			return;
 		}
 		this.retransmissionThread.setDaemon(true);
 		this.retransmissionThread.start();	
 		
 		// ENHANCED WINDOWED TRANSMISSION - QUIC-style
-		System.out.println("🚀 Starting QUIC-inspired windowed transmission...");
+		System.out.println("Starting QUIC-inspired windowed transmission...");
 		int seqNo = 0;
 		long startTime = System.currentTimeMillis();
 		long lastProgressTime = startTime;
@@ -293,15 +292,11 @@ public class EnhancedFileTransferSender {
 	    		int remaining = mem.capacity() - off;
 	    		int take  = Math.min(SLICE_SIZE, remaining);
 	    		
-	    		// TEKER TEKER GÖNDERİM - Her paketten sonra küçük pause
+	    		// DYNAMIC RTT-BASED PACING - Controller'ın hesapladığı değeri kullan
 	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
 	                
-	                // WAN için packet pacing - network'ü tıkamayalım
-	                if (!isLocalNetwork) {
-	                	LockSupport.parkNanos(50_000); // 50μs bekle - WAN için
-	                } else {
-	                	LockSupport.parkNanos(1_000); // 1μs bekle - LAN için
-	                }
+	                // Controller'dan dynamic pacing al - RTT'ye göre adaptive
+	                // rateLimitSend() zaten internal pacing yapıyor, ekstra sabit pacing yok!
 	                
 	                off += take;
 	                seqNo++;
@@ -311,31 +306,31 @@ public class EnhancedFileTransferSender {
 	                	double progress = (double)off / mem.capacity() * 100;
 	                	long elapsed = System.currentTimeMillis() - startTime;
 	                	double throughputMbps = (off * 8.0) / (elapsed * 1000.0);
-	                	System.out.printf("📤 Progress: %.1f%%, Throughput: %.1f Mbps\n", progress, throughputMbps);
-	                	System.out.println("🎯 " + hybridControl.getStats());
+	                	System.out.printf(" Progress: %.1f%%, Throughput: %.1f Mbps\n", progress, throughputMbps);
+	                	System.out.println(" " + hybridControl.getStats());
 	                	lastProgressTime = System.currentTimeMillis();
 	                }
 	    	}
 	    	
 	    	initialTransmissionDone[0] = true;
-	    	System.out.println("✅ Initial transmission completed, waiting for retransmissions...");
+	    	System.out.println("Initial transmission completed, waiting for retransmissions...");
 	    	
 	    	// Transfer completion bekle
 	    	try {
 	    		boolean completed = transferCompleteLatch.await(300, TimeUnit.SECONDS);
 	    		if(completed) {
-	    			System.out.println("🎉 File transfer completed successfully!");
-	    			System.out.println("📈 Final stats: " + hybridControl.getStats());
+	    			System.out.println(" File transfer completed successfully!");
+	    			System.out.println(" Final stats: " + hybridControl.getStats());
 	    		} else {
-	    			System.err.println("⏰ Transfer timeout - network issue or very large file");
+	    			System.err.println(" Transfer timeout - network issue or very large file");
 	    		}
 	    	} catch(InterruptedException e) {
-	    		System.err.println("❌ Transfer interrupted");
+	    		System.err.println("Transfer interrupted");
 	    		Thread.currentThread().interrupt();
 	    	}
 	    	}finally {
 	    		// Enhanced cleanup
-	    		System.out.println("🧹 Cleaning up enhanced transfer threads...");
+	    		System.out.println(" Cleaning up enhanced transfer threads...");
 	    		
 	    		if(nackThread != null && nackThread.isAlive()) {
 	    			nackThread.interrupt();
@@ -361,7 +356,7 @@ public class EnhancedFileTransferSender {
 	    		
 	    		// Reset controller
 	    		if (hybridControl != null) {
-	    			System.out.println("📊 Transfer summary: " + hybridControl.getStats());
+	    			System.out.println(" Transfer summary: " + hybridControl.getStats());
 	    		}
 	    	}
 	    }

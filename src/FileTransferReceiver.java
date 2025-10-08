@@ -145,7 +145,9 @@ public class FileTransferReceiver {
 	transferStartTime = System.currentTimeMillis();
 	System.out.println("📊 Data transfer başladı - timing başlatıldı");
 	
-	NackSender sender = new NackSender(channel, fileId, file_size, total_seq, mem_buf);
+	// Enhanced NackSender with congestion control - RTT measurement aktif!
+	HybridCongestionController receiverCongestionControl = new HybridCongestionController();
+	NackSender sender = new NackSender(channel, fileId, file_size, total_seq, mem_buf, receiverCongestionControl);
 	
 	// Transfer completion için CountDownLatch kullan
 	CountDownLatch transferLatch = new CountDownLatch(1);

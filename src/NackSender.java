@@ -19,6 +19,9 @@ public class NackSender implements Runnable{
 	
 	// Completion callback
 	public volatile Runnable onTransferComplete = null;
+	
+	// Enhanced congestion control reference  
+	public volatile HybridCongestionController hybridControl = null;
 
 	public NackSender(DatagramChannel channel, long fileId, int file_size,
 			int total_seq, MappedByteBuffer mem_buf){
@@ -29,6 +32,13 @@ public class NackSender implements Runnable{
 		this.mem_buf = mem_buf;
 		this.recv = new BitSet(total_seq);
 		this.frame = new NackFrame();
+	}
+	
+	// Enhanced constructor with congestion control
+	public NackSender(DatagramChannel channel, long fileId, int file_size,
+			int total_seq, MappedByteBuffer mem_buf, HybridCongestionController hybridControl){
+		this(channel, fileId, file_size, total_seq, mem_buf);
+		this.hybridControl = hybridControl;
 	}
 
 	public volatile int cum_Ack = 0;
@@ -106,8 +116,11 @@ public class NackSender implements Runnable{
 			return;
 		}
 		
-		// Extract payload - safely slice
-		ByteBuffer payload = fullPacket.slice(CRC32C_HEADER_SIZE, payloadLen);
+		// Extract payload - safely slice (Java 8 uyumlu)
+		fullPacket.position(CRC32C_HEADER_SIZE);
+		fullPacket.limit(CRC32C_HEADER_SIZE + payloadLen);
+		ByteBuffer payload = fullPacket.slice();
+		fullPacket.clear(); // Reset position/limit
 		
 
 		// CRC validation
@@ -146,6 +159,11 @@ public class NackSender implements Runnable{
 					// Sadece başarılı yazma sonrası mark et
 					recv.set(seqNo);
 					
+					// Congestion control feedback - packet successfully received (ACK)
+					if(hybridControl != null) {
+						hybridControl.onPacketAcked(payloadLen);
+					}
+					
 				} catch(Exception e) {
 					System.err.println("Memory write error for seq " + seqNo + ": " + e);
 					return;
@@ -158,6 +176,12 @@ public class NackSender implements Runnable{
 			synchronized(this) {
 				recv.clear(seqNo);
 			}
+			
+			// Congestion control feedback - packet loss detected
+			if(hybridControl != null) {
+				hybridControl.onPacketLoss(1, payloadLen);
+			}
+			
 			// CRC mismatch - sessizce ignore et (network'te bozulmuş paket)
 		}
 	}
@@ -182,8 +206,16 @@ public class NackSender implements Runnable{
 		int missing = total_seq - received;
 		double progress = (received * 100.0) / total_seq;
 		
-		System.out.printf("Transfer Status: %.2f%% (%d/%d packets, %d missing, cumAck=%d)%n", 
-		    progress, received, total_seq, missing, cum_Ack);
+		// RTT ve congestion info
+		String congestionInfo = "";
+		if(hybridControl != null) {
+			long rttMs = hybridControl.getSmoothedRtt() / 1_000_000;
+			long cwndPkts = hybridControl.getCongestionWindow() / PAYLOAD_SIZE;
+			congestionInfo = String.format(", RTT=%dms, CWND=%d pkts", rttMs, cwndPkts);
+		}
+		
+		System.out.printf("Transfer Status: %.2f%% (%d/%d packets, %d missing, cumAck=%d%s)%n", 
+		    progress, received, total_seq, missing, cum_Ack, congestionInfo);
 	}
 	
 
@@ -199,7 +231,14 @@ public class NackSender implements Runnable{
 			do{
 				r = channel.write(frame.buffer().duplicate());
 				if(r == 0) {
-					LockSupport.parkNanos(50_000); // Daha kısa bekleme
+					// Dynamic backoff based on congestion state
+					long backoffNs = 50_000; // Default 50μs
+					if(hybridControl != null) {
+						// Get current pacing interval as backoff guide
+						long pacingInterval = hybridControl.getPacingInterval();
+						backoffNs = Math.min(pacingInterval / 4, 200_000); // Max 200μs
+					}
+					LockSupport.parkNanos(backoffNs);
 					retries++;
 					if(retries >= MAX_RETRIES) {
 						System.err.println("NACK frame send failed after " + MAX_RETRIES + " retries");
@@ -209,7 +248,7 @@ public class NackSender implements Runnable{
 			}while(r == 0 && retries < MAX_RETRIES);
 		}catch(IOException e){
 			System.err.println("NACK write failed: " + e.getMessage());
-			// Don't throw RuntimeException, just logmand continue
+			// Don't throw RuntimeException, just log and continue
 		}
 	}
 	
@@ -236,7 +275,16 @@ public class NackSender implements Runnable{
 	{
 		if(nackHandle == null || nackHandle.isCancelled() || nackHandle.isDone())
 		{
-		  nackHandle = scheduler.scheduleAtFixedRate(nack_service, 0 , 25, TimeUnit.MILLISECONDS); // Daha hızlı NACK gönderimi
+			// Dynamic NACK interval based on RTT
+			long nackIntervalMs = 25; // Default 25ms
+			if(hybridControl != null) {
+				long rttMs = hybridControl.getSmoothedRtt() / 1_000_000; // ns to ms
+				if(rttMs > 0) {
+					// NACK interval = RTT/4, min 10ms, max 50ms
+					nackIntervalMs = Math.max(10, Math.min(50, rttMs / 4));
+				}
+			}
+			nackHandle = scheduler.scheduleAtFixedRate(nack_service, 0, nackIntervalMs, TimeUnit.MILLISECONDS);
 		}
 	}
 	public void stopNackLoop(){
@@ -280,7 +328,7 @@ public class NackSender implements Runnable{
 					try{
 					x = channel.read(buf);
 					}catch(java.net.PortUnreachableException e){
-						System.err.println("⚠️  Sender port unreachable - connection may be closed: " + e.getMessage());
+						System.err.println("Sender port unreachable - connection may be closed: " + e.getMessage());
 						LockSupport.parkNanos(10_000_000); // 10ms bekle ve tekrar dene
 						x = 0; // Reset x for retry
 						continue;
@@ -328,7 +376,7 @@ public class NackSender implements Runnable{
 			completionFrame.flip();
 			
 			channel.write(completionFrame);
-			System.out.println("✅ Transfer completion signal sent to sender");
+			System.out.println("Transfer completion signal sent to sender");
 		} catch(IOException e) {
 			System.err.println("Failed to send completion signal: " + e);
 		}
