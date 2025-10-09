@@ -2,6 +2,12 @@
 test_*.bin
 *.bin
 
+# Test dosyaları ve klasörü
+test-files/
+src/test-files/
+
+*.sh
+
 # Derleme dosyaları
 *.class
 
