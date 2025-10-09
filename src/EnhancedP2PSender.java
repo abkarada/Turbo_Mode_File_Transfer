@@ -97,15 +97,10 @@ public class EnhancedP2PSender {
             senderChannel.connect(targetAddress);
             System.out.println("✅ Target'a bağlandı: " + targetAddress);
             
-            // Network type detection
-            boolean isLocal = targetIp.equals("127.0.0.1") || targetIp.equals("localhost") ||
-                            targetIp.startsWith("192.168.") || targetIp.startsWith("10.");
+            // Always use WAN mode - LAN mode disabled due to excessive packet loss
+            boolean isLocal = false; // ❌ LAN mode tamamen kapatıldı
             
-            if (isLocal) {
-                System.out.println("🏠 Local network detected - Enabling aggressive mode");
-            } else {
-                System.out.println("🌐 WAN detected - Enabling conservative mode");
-            }
+            System.out.println("🌐 WAN mode enabled - Optimized for stability and performance");
             System.out.println("");
             
             // Enhanced FileTransferSender kullan

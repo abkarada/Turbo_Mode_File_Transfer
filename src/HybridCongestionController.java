@@ -55,8 +55,7 @@ public class HybridCongestionController {
     // Constants
     private static final int PACKET_SIZE = 1450;
     private static final double CUBIC_C = 0.4; // QUIC CUBIC constant
-    private static final double PACING_GAIN = 1.25; // %25 fazla pacing
-    private static final long MIN_PACING_INTERVAL = 500; // 500ns minimum
+    private static final long MIN_PACING_INTERVAL = 250; // 250ns minimum (optimized for WAN)
     
     public HybridCongestionController() {
         updatePacingRate();
@@ -158,16 +157,22 @@ public class HybridCongestionController {
 		bytesInFlight.set(Math.max(0, currentInFlight - lostBytes));
 		packetsInFlight.set(Math.max(0, currentPackets - lostPacketCount));        lastNackTime = System.nanoTime();
         
-        // QUIC-style congestion response
+        // QUIC-style congestion response - gentler for WAN
         if (state != CongestionState.RECOVERY) {
             state = CongestionState.RECOVERY;
             
-            // CUBIC multiplicative decrease
-            slowStartThreshold = congestionWindow / 2;
-            congestionWindow = Math.max(slowStartThreshold, 4 * PACKET_SIZE);
-            
-            // Bandwidth estimate'i de düşür
-            estimatedBandwidthBps = (long)(estimatedBandwidthBps * 0.8);
+            // Gentler multiplicative decrease for WAN
+            if (isLocalNetwork) {
+                // Local network - aggressive backoff
+                slowStartThreshold = congestionWindow / 2;
+                congestionWindow = Math.max(slowStartThreshold, 4 * PACKET_SIZE);
+                estimatedBandwidthBps = (long)(estimatedBandwidthBps * 0.5); // 50% reduction
+            } else {
+                // WAN - gentler backoff for better recovery
+                slowStartThreshold = (congestionWindow * 3) / 4;  // 75% threshold (was 50%)
+                congestionWindow = Math.max(slowStartThreshold, 8 * PACKET_SIZE); // Min 8 packets (was 4)
+                estimatedBandwidthBps = (long)(estimatedBandwidthBps * 0.8); // 20% reduction (was 50%)
+            }
             
             updatePacingRate();
             
@@ -233,20 +238,22 @@ public class HybridCongestionController {
             return;
         }
         
+        // Optimized WAN pacing - faster but stable
         // Bandwidth-delay product aware pacing
         long bdp = (estimatedBandwidthBps * smoothedRtt) / 1_000_000_000L;
         long targetWindow = Math.max(congestionWindow, bdp);
         
-        // Pacing rate = (window / RTT) * gain
-        pacingRate = (long)((targetWindow * 1_000_000_000L * PACING_GAIN) / smoothedRtt);
-        pacingRate = Math.min(pacingRate, estimatedBandwidthBps * 2); // Max 2x bandwidth
+        // Pacing rate = (window / RTT) * gain - higher gain for WAN
+        double pacingGain = (state == CongestionState.RECOVERY) ? 1.0 : 1.5; // Dynamic gain
+        pacingRate = (long)((targetWindow * 1_000_000_000L * pacingGain) / smoothedRtt);
+        pacingRate = Math.min(pacingRate, estimatedBandwidthBps * 3); // Max 3x bandwidth (was 2x)
         
-        // Packet interval calculation
+        // Faster packet intervals for WAN
         if (pacingRate > 0) {
             packetIntervalNs = (PACKET_SIZE * 1_000_000_000L) / pacingRate;
-            packetIntervalNs = Math.max(packetIntervalNs, MIN_PACING_INTERVAL);
+            packetIntervalNs = Math.max(packetIntervalNs, 250); // 250ns minimum (was 500ns)
         } else {
-            packetIntervalNs = MIN_PACING_INTERVAL;
+            packetIntervalNs = 1000; // 1μs default for WAN
         }
     }
     
@@ -255,21 +262,24 @@ public class HybridCongestionController {
      */
     public void enableLocalNetworkMode() {
         isLocalNetwork = true;
-        maxCongestionWindow = 2048 * PACKET_SIZE; // Çok büyük window
-        congestionWindow = 512 * PACKET_SIZE; // Ultra aggressive başlangıç
-        slowStartThreshold = Long.MAX_VALUE; // Slow start'ta kal
-        packetIntervalNs = 0;
-        estimatedBandwidthBps = 1_000_000_000; // 1 Gbps
-        smoothedRtt = 500_000; // 0.5ms başlangıç RTT
+        // BALANCED LOCAL MODE - Not too aggressive to avoid packet loss
+        maxCongestionWindow = 128 * PACKET_SIZE;  // 128 packets max (was 2048!)  
+        congestionWindow = 16 * PACKET_SIZE;      // 16 packets start (was 512!)
+        slowStartThreshold = 64 * PACKET_SIZE;    // Exit slow start early
+        estimatedBandwidthBps = 100_000_000;      // 100 Mbps conservative estimate
+        smoothedRtt = 2_000_000; // 2ms realistic LAN RTT
+        packetIntervalNs = 500;  // 500ns minimal pacing (not 0!)
         System.out.println("⚡ LOCAL NETWORK MODE - Ultra aggressive, no rate limiting");
     }
     
     public void enableWanMode() {
         isLocalNetwork = false;
-        maxCongestionWindow = 256 * PACKET_SIZE;
-        congestionWindow = 32 * PACKET_SIZE;
+        // Optimized WAN settings - more aggressive than before
+        maxCongestionWindow = 128 * PACKET_SIZE;  // 128 packets (was 64)
+        congestionWindow = 32 * PACKET_SIZE;      // 32 packets start (was 16)
+        estimatedBandwidthBps = 50_000_000;       // 50 Mbps estimate
         updatePacingRate();
-        System.out.println("📡 WAN MODE - Conservative settings");
+        System.out.println("📡 WAN MODE - Optimized settings for stability and performance");
     }
     
     /**
@@ -279,7 +289,11 @@ public class HybridCongestionController {
         long now = System.nanoTime();
         long elapsed = now - startTime;
         double throughputMbps = (totalBytesSent.get() * 8.0 * 1_000_000_000L) / (elapsed * 1_000_000.0);
-        double lossRate = totalLossCount.get() * 100.0 / Math.max(1, totalPacketsSent.get());
+        
+        // Fix loss rate calculation - cap at 100%
+        long totalSent = Math.max(1, totalPacketsSent.get());
+        long totalLost = totalLossCount.get();
+        double lossRate = Math.min(100.0, (totalLost * 100.0) / (totalSent + totalLost));
         
         return String.format(
             "State: %s, CWnd: %d pkts, BW: %.1f Mbps, RTT: %.1fms, " +
