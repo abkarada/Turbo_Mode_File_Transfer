@@ -24,6 +24,7 @@ public class EnhancedFileTransferSender {
 	    private Thread statsThread;
 	    private Thread nackThread;
 	    private Thread retransmissionThread;
+	    private ChunkManager chunkManager;
 	    
 	    private static final ExecutorService threadPool = 
 	        Executors.newCachedThreadPool(r -> {
@@ -142,12 +143,10 @@ public class EnhancedFileTransferSender {
 	    	
 	    	try(FileChannel fc = FileChannel.open(filePath, StandardOpenOption.READ)){
 	    		long fileSize = fc.size();
-	    		if(fileSize > TURBO_MAX) throw new IllegalArgumentException("Turbo Mode is only for  ≤256 MB.");
 	    		
-	    		MappedByteBuffer mem = fc.map(FileChannel.MapMode.READ_ONLY, 0, fileSize);
-	    		for(int i = 0; i < MAX_TRY && !mem.isLoaded(); i++) mem.load();
-	    		
-	    		int totalSeq = (int) ((fileSize + SLICE_SIZE - 1) / SLICE_SIZE);
+	    		// Initialize ChunkManager for unlimited file size support
+	    		this.chunkManager = new ChunkManager(filePath, SLICE_SIZE);
+	    		int totalSeq = chunkManager.getTotalSequenceCount();
 	    		
 	    		// Thread-safe için her thread kendi instance'larını kullanacak
 	    		CRC32C initialCrc = new CRC32C();
@@ -264,15 +263,26 @@ public class EnhancedFileTransferSender {
     				continue;
     			}
     			
-    			int off = miss*SLICE_SIZE;
-    			int take = Math.min(SLICE_SIZE, mem.capacity() - off);
-    			if(take > 0) {
-					try{
-    				sendOne(retxCrc, retxPkt, mem, fileId, miss, totalSeq, take, off);
-    				}catch(IOException e){
-						System.err.println("Retransmission error for seq " + miss + ": " + e);
-					}
-				}
+    			// Chunk-aware retransmission: find which chunk contains this sequence
+    			try {
+    				int chunkIdx = chunkManager.findChunkForSequence(miss);
+    				if (chunkIdx < 0) {
+    					System.err.println("No chunk found for sequence: " + miss);
+    					continue;
+    				}
+    				
+    				ChunkMetadata chunkMeta = chunkManager.getChunkMetadata(chunkIdx);
+    				MappedByteBuffer chunkBuffer = chunkManager.getChunk(chunkIdx);
+    				int localSeq = chunkMeta.toLocalSequence(miss);
+    				int localOff = chunkMeta.getLocalOffset(localSeq, SLICE_SIZE);
+    				int take = chunkMeta.getPayloadSize(localSeq, SLICE_SIZE);
+    				
+    				if(take > 0) {
+    					sendOne(retxCrc, retxPkt, chunkBuffer, fileId, miss, totalSeq, take, localOff);
+    				}
+    			} catch(IOException e) {
+    				System.err.println("Retransmission error for seq " + miss + ": " + e);
+    			}
     		}
 	}, "enhanced-retransmission");
 		if (this.retransmissionThread == null) {
@@ -282,37 +292,48 @@ public class EnhancedFileTransferSender {
 		this.retransmissionThread.setDaemon(true);
 		this.retransmissionThread.start();	
 		
-		// ENHANCED WINDOWED TRANSMISSION - QUIC-style
-		System.out.println("Starting QUIC-inspired windowed transmission...");
+		// ENHANCED WINDOWED TRANSMISSION - QUIC-style with Chunk Support
+		System.out.println("Starting QUIC-inspired windowed transmission with chunked I/O...");
 		int seqNo = 0;
 		long startTime = System.currentTimeMillis();
 		long lastProgressTime = startTime;
 		
-	    	for(int off = 0; off < mem.capacity(); ){
-	    		int remaining = mem.capacity() - off;
-	    		int take  = Math.min(SLICE_SIZE, remaining);
-	    		
-	    		// DYNAMIC RTT-BASED PACING - Controller'ın hesapladığı değeri kullan
-	                sendOne(initialCrc, initialPkt, mem, fileId, seqNo, totalSeq, take, off);
-	                
-	                // Controller'dan dynamic pacing al - RTT'ye göre adaptive
-	                // rateLimitSend() zaten internal pacing yapıyor, ekstra sabit pacing yok!
-	                
-	                off += take;
-	                seqNo++;
-	                
-	                // Enhanced progress display
-	                if (System.currentTimeMillis() - lastProgressTime > 1000) {
-	                	double progress = (double)off / mem.capacity() * 100;
-	                	long elapsed = System.currentTimeMillis() - startTime;
-	                	double throughputMbps = (off * 8.0) / (elapsed * 1000.0);
-	                	System.out.printf(" Progress: %.1f%%, Throughput: %.1f Mbps\n", progress, throughputMbps);
-	                	System.out.println(" " + hybridControl.getStats());
-	                	lastProgressTime = System.currentTimeMillis();
-	                }
-	    	}
-	    	
-	    	initialTransmissionDone[0] = true;
+		// Chunk-based sequential transmission
+		int chunkCount = chunkManager.getChunkCount();
+		for(int chunkIdx = 0; chunkIdx < chunkCount; chunkIdx++) {
+			ChunkMetadata chunkMeta = chunkManager.getChunkMetadata(chunkIdx);
+			MappedByteBuffer chunkBuffer = chunkManager.getChunk(chunkIdx);
+			
+			// Send all sequences in this chunk
+			int localSeq = 0;
+			for(int off = 0; off < chunkBuffer.capacity(); ) {
+				int remaining = chunkBuffer.capacity() - off;
+				int take = Math.min(SLICE_SIZE, remaining);
+				
+				// DYNAMIC RTT-BASED PACING - Controller'ın hesapladığı değeri kullan
+				sendOne(initialCrc, initialPkt, chunkBuffer, fileId, seqNo, totalSeq, take, off);
+				
+				// Controller'dan dynamic pacing al - RTT'ye göre adaptive
+				// rateLimitSend() zaten internal pacing yapıyor, ekstra sabit pacing yok!
+				
+				off += take;
+				seqNo++;
+				localSeq++;
+				
+				// Enhanced progress display
+				if (System.currentTimeMillis() - lastProgressTime > 1000) {
+					double progress = (double)seqNo / totalSeq * 100;
+					long elapsed = System.currentTimeMillis() - startTime;
+					double throughputMbps = (seqNo * SLICE_SIZE * 8.0) / (elapsed * 1000.0);
+					System.out.printf(" Progress: %.1f%% (Chunk %d/%d), Throughput: %.1f Mbps\n", 
+						progress, chunkIdx + 1, chunkCount, throughputMbps);
+					System.out.println(" " + hybridControl.getStats());
+					lastProgressTime = System.currentTimeMillis();
+				}
+			}
+		}
+		
+		initialTransmissionDone[0] = true;
 	    	System.out.println("Initial transmission completed, waiting for retransmissions...");
 	    	
 	    	// Transfer completion bekle

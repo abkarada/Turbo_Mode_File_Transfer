@@ -19,7 +19,8 @@ public class FileTransferReceiver {
 	
 	public FileChannel fc;
 	public Path filePath;
-	public MappedByteBuffer mem_buf;
+	public MappedByteBuffer mem_buf;  // Legacy support - will be replaced by ChunkManager
+	public ChunkManager chunkManager;  // NEW: Chunk-based I/O for unlimited file size
 	public static final long MAX_FILE_SIZE = 256L << 20;
 	public static final int SLICE_SIZE = 1450; // Maximum payload without fragmentation
 	public static final int HEADER_SIZE = 22;
@@ -124,7 +125,17 @@ public class FileTransferReceiver {
 
 				fc.truncate(file_size);
 				
-				 mem_buf = fc.map(FileChannel.MapMode.READ_WRITE, 0, file_size);
+				// Initialize ChunkManager for unlimited file size support
+				// Use existing FileChannel (READ_WRITE mode)
+				this.chunkManager = new ChunkManager(fc, file_size, SLICE_SIZE);
+				
+				// Legacy: Keep mem_buf for backward compatibility (will map first chunk)
+				if (file_size <= MAX_FILE_SIZE) {
+					mem_buf = fc.map(FileChannel.MapMode.READ_WRITE, 0, file_size);
+				} else {
+					System.out.println("⚠️  Large file detected (" + (file_size >> 20) + " MB) - using chunked I/O");
+					mem_buf = null; // Signal to use ChunkManager
+				}
 
 				 return true;
 
@@ -147,7 +158,16 @@ public class FileTransferReceiver {
 	
 	// Enhanced NackSender with congestion control - RTT measurement aktif!
 	HybridCongestionController receiverCongestionControl = new HybridCongestionController();
-	NackSender sender = new NackSender(channel, fileId, file_size, total_seq, mem_buf, receiverCongestionControl);
+	NackSender sender;
+	
+	// Use appropriate constructor based on file size
+	if (mem_buf != null) {
+		// Small file: use legacy MappedByteBuffer mode
+		sender = new NackSender(channel, fileId, file_size, total_seq, mem_buf, receiverCongestionControl);
+	} else {
+		// Large file: use ChunkManager mode
+		sender = new NackSender(channel, fileId, file_size, total_seq, chunkManager, receiverCongestionControl);
+	}
 	
 	// Transfer completion için CountDownLatch kullan
 	CountDownLatch transferLatch = new CountDownLatch(1);

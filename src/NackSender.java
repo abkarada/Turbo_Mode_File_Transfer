@@ -16,6 +16,7 @@ public class NackSender implements Runnable{
 	public final BitSet recv;
 	public final NackFrame frame;
 	public final MappedByteBuffer mem_buf;
+	public final ChunkManager chunkManager; // NEW: For large files
 	
 	// Completion callback
 	public volatile Runnable onTransferComplete = null;
@@ -23,6 +24,7 @@ public class NackSender implements Runnable{
 	// Enhanced congestion control reference  
 	public volatile HybridCongestionController hybridControl = null;
 
+	// Legacy constructor (backward compatibility)
 	public NackSender(DatagramChannel channel, long fileId, int file_size,
 			int total_seq, MappedByteBuffer mem_buf){
 		this.channel = channel;
@@ -30,6 +32,7 @@ public class NackSender implements Runnable{
 		this.file_size = file_size;
 		this.total_seq = total_seq;
 		this.mem_buf = mem_buf;
+		this.chunkManager = null;
 		this.recv = new BitSet(total_seq);
 		this.frame = new NackFrame();
 	}
@@ -37,7 +40,28 @@ public class NackSender implements Runnable{
 	// Enhanced constructor with congestion control
 	public NackSender(DatagramChannel channel, long fileId, int file_size,
 			int total_seq, MappedByteBuffer mem_buf, HybridCongestionController hybridControl){
-		this(channel, fileId, file_size, total_seq, mem_buf);
+		this.channel = channel;
+		this.fileId = fileId;
+		this.file_size = file_size;
+		this.total_seq = total_seq;
+		this.mem_buf = mem_buf;
+		this.chunkManager = null;
+		this.recv = new BitSet(total_seq);
+		this.frame = new NackFrame();
+		this.hybridControl = hybridControl;
+	}
+	
+	// FULL constructor with ChunkManager (for large files > 256MB)
+	public NackSender(DatagramChannel channel, long fileId, int file_size,
+			int total_seq, ChunkManager chunkManager, HybridCongestionController hybridControl){
+		this.channel = channel;
+		this.fileId = fileId;
+		this.file_size = file_size;
+		this.total_seq = total_seq;
+		this.mem_buf = null; // Using ChunkManager instead
+		this.chunkManager = chunkManager;
+		this.recv = new BitSet(total_seq);
+		this.frame = new NackFrame();
 		this.hybridControl = hybridControl;
 	}
 
@@ -131,40 +155,57 @@ public class NackSender implements Runnable{
 		if(calculatedCrc == receivedCrc){
 			int off = seqNo * PAYLOAD_SIZE;
 			
-			// Buffer bounds check - daha kesin
-			if(off < 0 || off >= mem_buf.capacity() || off + payloadLen > mem_buf.capacity()) {
-				System.err.println("Buffer bounds error: seqNo=" + seqNo + ", off=" + off + ", payloadLen=" + payloadLen + ", capacity=" + mem_buf.capacity());
-				return;
-			}
-			
-			// Eğer bu paket zaten alınmışsa, tekrar yazma
-			synchronized(this) {
-				if(recv.get(seqNo)) {
-					// Zaten alınmış, skip
+			// Chunk-aware write logic
+			if (chunkManager != null) {
+				// Large file mode: use ChunkManager
+				try {
+					int chunkIdx = chunkManager.findChunkForSequence(seqNo);
+					if (chunkIdx < 0) {
+						System.err.println("No chunk found for sequence: " + seqNo);
+						return;
+					}
+					
+					ChunkMetadata chunkMeta = chunkManager.getChunkMetadata(chunkIdx);
+					MappedByteBuffer chunkBuffer = chunkManager.getChunk(chunkIdx);
+					int localSeq = chunkMeta.toLocalSequence(seqNo);
+					int localOff = chunkMeta.getLocalOffset(localSeq, PAYLOAD_SIZE);
+					
+					synchronized(this) {
+						if(recv.get(seqNo)) return; // Already received
+						
+						MappedByteBuffer view = chunkBuffer.duplicate();
+						view.position(localOff);
+						view.limit(localOff + payloadLen);
+						
+						ByteBuffer payloadToPut = payload.duplicate();
+						payloadToPut.rewind();
+						view.put(payloadToPut);
+						
+						recv.set(seqNo);
+					}
+				} catch(IOException e) {
+					System.err.println("Chunk write error for seq " + seqNo + ": " + e);
+					return;
+				}
+			} else {
+				// Legacy mode: use single MappedByteBuffer
+				if(off < 0 || off >= mem_buf.capacity() || off + payloadLen > mem_buf.capacity()) {
+					System.err.println("Buffer bounds error: seqNo=" + seqNo + ", off=" + off + ", payloadLen=" + payloadLen + ", capacity=" + mem_buf.capacity());
 					return;
 				}
 				
-				// Memory'ye yaz
-				try {
+				synchronized(this) {
+					if(recv.get(seqNo)) return;
+					
 					MappedByteBuffer view = mem_buf.duplicate();
 					view.position(off);
 					view.limit(off + payloadLen);
 					
-					// Payload'ı temiz bir şekilde kopyala
 					ByteBuffer payloadToPut = payload.duplicate();
-					payloadToPut.rewind(); // Position'ı 0'a al
+					payloadToPut.rewind();
 					
 					view.put(payloadToPut);
-					
-					// Sadece başarılı yazma sonrası mark et
 					recv.set(seqNo);
-					
-					// NACK-based: Receiver'da congestion control yok, sadece sender'da
-					// Bu kısım gereksiz, kaldırıldı
-					
-				} catch(Exception e) {
-					System.err.println("Memory write error for seq " + seqNo + ": " + e);
-					return;
 				}
 			}
 			
