@@ -173,13 +173,9 @@ public class EnhancedNackListener implements Runnable{
 				}
 				
 				// NACK frame feedback - bandwidth ve congestion update
+				// onNackFrameReceived() zaten loss'u handle ediyor, çift sayma yok!
 				if(hybridControl != null) {
 					hybridControl.onNackFrameReceived(receivedCount, lossCount);
-				}
-				
-				// Loss notification - sadece gerçek loss varsa
-				if(hybridControl != null && lossCount > 0) {
-					hybridControl.onPacketLoss(lossCount);
 				}
 				
 				// Transfer completion kontrolü - eğer base + 64 >= totalSeq ve tüm bitler 1 ise tamamlanmış
