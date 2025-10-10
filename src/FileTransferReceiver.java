@@ -14,7 +14,7 @@ import java.util.concurrent.TimeUnit;
 public class FileTransferReceiver {	
 	public  DatagramChannel channel;
 	public long fileId;
-	public int file_size;
+	public long file_size;  // Changed to long for large file support
 	public int total_seq;
 	
 	public FileChannel fc;
@@ -46,18 +46,28 @@ public class FileTransferReceiver {
 		
 		SocketAddress senderAddress = null;
 		r = 0; // Initialize r
+		int receiveAttempts = 0; // DEBUG: Count attempts
 		try{
 			do{
 				if(System.nanoTime() > handshakeDeadline) {
-					System.err.println("Handshake timeout after 30 seconds");
+					System.err.println("❌ Handshake timeout after 30 seconds (attempts: " + receiveAttempts + ")");
 					return false;
 				}
 				
 				senderAddress = channel.receive(rcv_syn);
+				receiveAttempts++;
+				
+				// DEBUG: Log every 1000 attempts
+				if(receiveAttempts % 1000 == 0) {
+					System.out.println("⏳ Waiting for SYN... (attempts: " + receiveAttempts + ")");
+				}
+				
 				if(senderAddress == null) {
 					LockSupport.parkNanos(1_000_000); // 1ms bekleme
 					continue;
 				}
+				
+				System.out.println("📬 Received packet from: " + senderAddress + " (size: " + rcv_syn.position() + " bytes)");
 				
 				r = rcv_syn.position();
 				if( r == 0 || r != HandShake_Packet.HEADER_SIZE || HandShake_Packet.get_signal(rcv_syn) != HandShake_Packet.SYN) {

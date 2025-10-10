@@ -10,7 +10,7 @@ import java.util.zip.CRC32C;
 
 public class NackSender implements Runnable{
 	public final long fileId;
-	public final int file_size;
+	public final long file_size;  // Changed to long for large file support
 	public final int total_seq;
 	public final DatagramChannel channel;
 	public final BitSet recv;
@@ -25,7 +25,7 @@ public class NackSender implements Runnable{
 	public volatile HybridCongestionController hybridControl = null;
 
 	// Legacy constructor (backward compatibility)
-	public NackSender(DatagramChannel channel, long fileId, int file_size,
+	public NackSender(DatagramChannel channel, long fileId, long file_size,
 			int total_seq, MappedByteBuffer mem_buf){
 		this.channel = channel;
 		this.fileId = fileId;
@@ -38,7 +38,7 @@ public class NackSender implements Runnable{
 	}
 	
 	// Enhanced constructor with congestion control
-	public NackSender(DatagramChannel channel, long fileId, int file_size,
+	public NackSender(DatagramChannel channel, long fileId, long file_size,
 			int total_seq, MappedByteBuffer mem_buf, HybridCongestionController hybridControl){
 		this.channel = channel;
 		this.fileId = fileId;
@@ -52,7 +52,7 @@ public class NackSender implements Runnable{
 	}
 	
 	// FULL constructor with ChunkManager (for large files > 256MB)
-	public NackSender(DatagramChannel channel, long fileId, int file_size,
+	public NackSender(DatagramChannel channel, long fileId, long file_size,
 			int total_seq, ChunkManager chunkManager, HybridCongestionController hybridControl){
 		this.channel = channel;
 		this.fileId = fileId;
@@ -173,11 +173,22 @@ public class NackSender implements Runnable{
 					synchronized(this) {
 						if(recv.get(seqNo)) return; // Already received
 						
+						// Bounds check for chunk write
+						if(localOff + payloadLen > chunkBuffer.capacity()) {
+							System.err.println("⚠️  Chunk bounds exceeded: localOff=" + localOff + 
+								", payloadLen=" + payloadLen + ", capacity=" + chunkBuffer.capacity() + 
+								", seqNo=" + seqNo);
+							// Adjust payload length to fit
+							payloadLen = chunkBuffer.capacity() - localOff;
+							System.out.println("✂️  Adjusted payloadLen to: " + payloadLen);
+						}
+						
 						MappedByteBuffer view = chunkBuffer.duplicate();
 						view.position(localOff);
 						view.limit(localOff + payloadLen);
 						
 						ByteBuffer payloadToPut = payload.duplicate();
+						payloadToPut.limit(payloadLen); // Limit to actual payload size
 						payloadToPut.rewind();
 						view.put(payloadToPut);
 						
@@ -189,9 +200,15 @@ public class NackSender implements Runnable{
 				}
 			} else {
 				// Legacy mode: use single MappedByteBuffer
-				if(off < 0 || off >= mem_buf.capacity() || off + payloadLen > mem_buf.capacity()) {
-					System.err.println("Buffer bounds error: seqNo=" + seqNo + ", off=" + off + ", payloadLen=" + payloadLen + ", capacity=" + mem_buf.capacity());
+				if(off < 0 || off >= mem_buf.capacity()) {
+					System.err.println("Buffer bounds error: seqNo=" + seqNo + ", off=" + off + ", capacity=" + mem_buf.capacity());
 					return;
+				}
+				
+				// Adjust payload if it exceeds buffer
+				if(off + payloadLen > mem_buf.capacity()) {
+					System.out.println("⚠️  Adjusting payload: off=" + off + ", payloadLen=" + payloadLen + " → " + (mem_buf.capacity() - off));
+					payloadLen = mem_buf.capacity() - off;
 				}
 				
 				synchronized(this) {
@@ -202,6 +219,7 @@ public class NackSender implements Runnable{
 					view.limit(off + payloadLen);
 					
 					ByteBuffer payloadToPut = payload.duplicate();
+					payloadToPut.limit(payloadLen); // Limit to actual payload size
 					payloadToPut.rewind();
 					
 					view.put(payloadToPut);

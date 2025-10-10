@@ -47,7 +47,7 @@ public class EnhancedFileTransferSender {
 	        this.stopRequested = true;
 	    }
 
-		public boolean handshake(long fileId, int file_size, int total_seq) throws IOException {
+		public boolean handshake(long fileId, long file_size, int total_seq) throws IOException {
 		if(channel == null) throw new IllegalStateException("Datagram Channel is null you must bind and connect first");
 		long candidate_file_Id = -1;
 		HandShake_Packet pkt = new HandShake_Packet();
@@ -155,12 +155,10 @@ public class EnhancedFileTransferSender {
 			long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
 			final long MAX_BACKOFF = 10_000_000L;
 			long backoff  = 1_000_000L;
-			boolean hand_shaking;
-			do{
-				hand_shaking = handshake(fileId, (int) fileSize, totalSeq);
-				if(hand_shaking) break;
-
-				if(Thread.currentThread().isInterrupted()){
+		boolean hand_shaking;
+		do{
+			hand_shaking = handshake(fileId, fileSize, totalSeq);  // Changed: long fileSize (no cast)
+			if(hand_shaking) break;				if(Thread.currentThread().isInterrupted()){
 					throw new IllegalStateException("Handshake Thread interrupted");
 				}
 				if(System.nanoTime() > deadline){
