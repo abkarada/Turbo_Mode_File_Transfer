@@ -128,9 +128,9 @@ public class EnhancedNackListener implements Runnable{
 					continue;
 				}
 				
-				// Process ACKs and NACKs with RTT measurement
+				// Process NACKs (implicit ACKs) with RTT measurement
 				int lossCount = 0;
-				int ackCount = 0;
+				int implicitAckCount = 0;
 				long totalRtt = 0;
 				int rttSamples = 0;
 				
@@ -149,8 +149,8 @@ public class EnhancedNackListener implements Runnable{
 							lossCount++;
 						}
 					} else {
-						// ACK - RTT measurement
-						ackCount++;
+						// Implicit ACK (mask bit = 1 = paket alındı)
+						implicitAckCount++;
 						
 						// RTT calculation - sadece mantıklı RTT'ler
 						Long sendTime = packetSendTimes.remove(seq);
@@ -162,11 +162,6 @@ public class EnhancedNackListener implements Runnable{
 								rttSamples++;
 							}
 						}
-						
-						// Notify congestion controller about ACK
-						if(hybridControl != null) {
-							hybridControl.onPacketAcked(1450); // Standard packet size
-						}
 					}
 				}
 				
@@ -175,6 +170,11 @@ public class EnhancedNackListener implements Runnable{
 					long avgRtt = totalRtt / rttSamples;
 					hybridControl.updateRtt(avgRtt);
 					lastRttMeasurement = receiveTime;
+				}
+				
+				// Implicit ACK notification - NACK frame'de alınan paketler
+				if(hybridControl != null && implicitAckCount > 0) {
+					hybridControl.onNackImplicitAck(implicitAckCount);
 				}
 				
 				// Loss notification

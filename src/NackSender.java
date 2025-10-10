@@ -159,10 +159,8 @@ public class NackSender implements Runnable{
 					// Sadece başarılı yazma sonrası mark et
 					recv.set(seqNo);
 					
-					// Congestion control feedback - packet successfully received (ACK)
-					if(hybridControl != null) {
-						hybridControl.onPacketAcked(payloadLen);
-					}
+					// NACK-based: Receiver'da congestion control yok, sadece sender'da
+					// Bu kısım gereksiz, kaldırıldı
 					
 				} catch(Exception e) {
 					System.err.println("Memory write error for seq " + seqNo + ": " + e);
@@ -177,11 +175,7 @@ public class NackSender implements Runnable{
 				recv.clear(seqNo);
 			}
 			
-			// Congestion control feedback - packet loss detected
-			if(hybridControl != null) {
-				hybridControl.onPacketLoss(1, payloadLen);
-			}
-			
+			// NACK-based: CRC mismatch sadece log, sender NACK alınca tekrar gönderecek
 			// CRC mismatch - sessizce ignore et (network'te bozulmuş paket)
 		}
 	}

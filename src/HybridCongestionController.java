@@ -1,5 +1,4 @@
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -13,9 +12,13 @@ public class HybridCongestionController {
     private volatile long slowStartThreshold = Long.MAX_VALUE;
     private volatile long maxCongestionWindow = 256 * 1450; // 256 packets max
     
-    // Bandwidth estimation (QUIC DeliveryRateEstimator benzeri)
+    // Bandwidth estimation - NACK-based delivery rate tracking
     private volatile long estimatedBandwidthBps = 10_000_000; // 10 Mbps başlangıç
-    private volatile long maxBandwidthBps = 100_000_000; // 100 Mbps max estimate
+    private volatile long maxBandwidthBps = 1_000_000_000; // 1 Gbps max for LAN
+    
+    // Delivery rate tracking for bandwidth estimation
+    private final AtomicLong deliveredBytes = new AtomicLong(0);
+    private volatile long deliveryRateStartTime = System.nanoTime();
     
     // Pacing rate (bytes per second)
     private volatile long pacingRate = estimatedBandwidthBps;
@@ -42,7 +45,6 @@ public class HybridCongestionController {
     private final AtomicLong totalPacketsSent = new AtomicLong(0);
     private final AtomicLong totalBytesSent = new AtomicLong(0);
     private final AtomicLong totalLossCount = new AtomicLong(0);
-    private volatile long lastStatsTime = System.nanoTime();
     private volatile long startTime = System.nanoTime();
     
     // Timing
@@ -54,34 +56,29 @@ public class HybridCongestionController {
     
     // Constants
     private static final int PACKET_SIZE = 1450;
-    private static final double CUBIC_C = 0.4; // QUIC CUBIC constant
-    private static final long MIN_PACING_INTERVAL = 250; // 250ns minimum (optimized for WAN)
     
     public HybridCongestionController() {
         updatePacingRate();
     }
     
     /**
-     * QUIC-style pacing with bandwidth awareness
+     * NACK-based pacing with bandwidth awareness
+     * LAN'da da mikro-pacing aktif - burst önleme
      */
     public void rateLimitSend() {
-        // Local networks için pacing yok
-        if (isLocalNetwork) {
-            return;
-        }
-        
         // Congestion window kontrolü
         if (bytesInFlight.get() >= congestionWindow) {
             // Window dolu - biraz bekle ve tekrar kontrol et
-            long waitTime = packetIntervalNs * 2;
+            long waitTime = packetIntervalNs > 0 ? packetIntervalNs * 2 : 10_000; // Min 10μs
             if (waitTime > 100_000) { // Max 100μs bekle
-                LockSupport.parkNanos(waitTime);
+                waitTime = 100_000;
             }
+            LockSupport.parkNanos(waitTime);
             return;
         }
         
-        // Pacing kontrolü
-        if (packetIntervalNs > MIN_PACING_INTERVAL) {
+        // Pacing kontrolü - LAN dahil tüm networkler için
+        if (packetIntervalNs > 0) {
             long now = System.nanoTime();
             long timeSinceLastSend = now - lastSendTime;
             
@@ -108,36 +105,50 @@ public class HybridCongestionController {
     }
     
 	/**
-	 * Packet acknowledged (via absence in NACK) - QUIC OnPacketAcked benzeri
+	 * NACK-based implicit acknowledgment - paket mask'te 1 = alınmış (ACK)
+	 * @param ackedPacketCount Kaç paket onaylandı
 	 */
-	public void onPacketAcked(int ackedBytes) {
-		// Sadece gerçekten in-flight olan bytes'ları düş
+	public void onNackImplicitAck(int ackedPacketCount) {
+		if (ackedPacketCount <= 0) return;
+		
+		int ackedBytes = ackedPacketCount * PACKET_SIZE;
+		
+		// In-flight tracking - doğru paket sayısı
 		long currentInFlight = bytesInFlight.get();
+		long currentPackets = packetsInFlight.get();
+		
 		if (currentInFlight >= ackedBytes) {
 			bytesInFlight.addAndGet(-ackedBytes);
-			packetsInFlight.decrementAndGet();
-		}        long now = System.nanoTime();
-        
-        // Bandwidth estimation güncelle
-        updateBandwidthEstimate(ackedBytes, now);
-        
-        // Congestion window büyüt (QUIC CUBIC benzeri)
-        if (state == CongestionState.SLOW_START) {
-            // Exponential growth
-            congestionWindow += ackedBytes;
-            if (congestionWindow >= slowStartThreshold) {
-                state = CongestionState.CONGESTION_AVOIDANCE;
-                System.out.println("🔄 Switched to CONGESTION_AVOIDANCE");
-            }
-        } else if (state == CongestionState.CONGESTION_AVOIDANCE) {
-            // CUBIC increase (simplified)
-            long increase = (ackedBytes * ackedBytes) / congestionWindow;
-            congestionWindow += Math.max(1, increase);
-        }
-        
-        congestionWindow = Math.min(congestionWindow, maxCongestionWindow);
-        updatePacingRate();
-    }
+		}
+		
+		if (currentPackets >= ackedPacketCount) {
+			packetsInFlight.addAndGet(-ackedPacketCount);
+		}
+		
+		// Delivery rate tracking - birikimli
+		deliveredBytes.addAndGet(ackedBytes);
+		long now = System.nanoTime();
+		
+		// Bandwidth estimation güncelle
+		updateBandwidthEstimate(now);
+		
+		// Congestion window büyüt - Reno-style additive increase
+		if (state == CongestionState.SLOW_START) {
+			// Exponential growth: her ACK için cwnd += ackedBytes
+			congestionWindow += ackedBytes;
+			if (congestionWindow >= slowStartThreshold) {
+				state = CongestionState.CONGESTION_AVOIDANCE;
+				System.out.println("🔄 Switched to CONGESTION_AVOIDANCE");
+			}
+		} else if (state == CongestionState.CONGESTION_AVOIDANCE) {
+			// Additive increase: cwnd += MSS * MSS / cwnd per ACK
+			long increase = (PACKET_SIZE * PACKET_SIZE) / congestionWindow;
+			congestionWindow += Math.max(1, increase * ackedPacketCount);
+		}
+		
+		congestionWindow = Math.min(congestionWindow, maxCongestionWindow);
+		updatePacingRate();
+	}
     
     /**
      * NACK-based loss detection - QUIC OnPacketLost benzeri
@@ -161,12 +172,12 @@ public class HybridCongestionController {
         if (state != CongestionState.RECOVERY) {
             state = CongestionState.RECOVERY;
             
-            // Gentler multiplicative decrease for WAN
+            // NACK-based congestion response
             if (isLocalNetwork) {
-                // Local network - aggressive backoff
-                slowStartThreshold = congestionWindow / 2;
-                congestionWindow = Math.max(slowStartThreshold, 4 * PACKET_SIZE);
-                estimatedBandwidthBps = (long)(estimatedBandwidthBps * 0.5); // 50% reduction
+                // LAN - minimal backoff, fast recovery
+                slowStartThreshold = (congestionWindow * 7) / 8;  // 87.5% minimal reduction
+                congestionWindow = Math.max(slowStartThreshold, 64 * PACKET_SIZE); // Min 64 packets
+                estimatedBandwidthBps = (long)(estimatedBandwidthBps * 0.9); // 10% reduction
             } else {
                 // WAN - gentler backoff for better recovery
                 slowStartThreshold = (congestionWindow * 3) / 4;  // 75% threshold (was 50%)
@@ -214,62 +225,67 @@ public class HybridCongestionController {
     }
     
     /**
-     * Bandwidth estimation update
+     * Bandwidth estimation update - NACK-based birikimli delivery rate
      */
-    private void updateBandwidthEstimate(int ackedBytes, long now) {
-        long elapsed = now - lastStatsTime;
-        if (elapsed > 100_000_000) { // 100ms'de bir güncelle
-            long currentRate = (ackedBytes * 1_000_000_000L) / elapsed;
+    private void updateBandwidthEstimate(long now) {
+        long elapsed = now - deliveryRateStartTime;
+        
+        // 100ms'de bir bandwidth güncelle
+        if (elapsed > 100_000_000) { 
+            long delivered = deliveredBytes.getAndSet(0); // Birikimli bytes'ı al ve sıfırla
             
-            // EWMA ile bandwidth estimate
-            estimatedBandwidthBps = (long)(0.7 * estimatedBandwidthBps + 0.3 * currentRate);
-            estimatedBandwidthBps = Math.min(estimatedBandwidthBps, maxBandwidthBps);
+            if (delivered > 0) {
+                // Delivery rate hesapla: bytes/second
+                long currentRate = (delivered * 1_000_000_000L) / elapsed;
+                
+                // EWMA ile bandwidth estimate
+                estimatedBandwidthBps = (long)(0.7 * estimatedBandwidthBps + 0.3 * currentRate);
+                estimatedBandwidthBps = Math.min(estimatedBandwidthBps, maxBandwidthBps);
+            }
             
-            lastStatsTime = now;
+            deliveryRateStartTime = now;
         }
     }
     
     /**
-     * Pacing rate calculation - QUIC PacingSender benzeri
+     * Pacing rate calculation - NACK-based
      */
     private void updatePacingRate() {
-        if (isLocalNetwork) {
-            packetIntervalNs = 0;
-            return;
-        }
-        
-        // Optimized WAN pacing - faster but stable
         // Bandwidth-delay product aware pacing
         long bdp = (estimatedBandwidthBps * smoothedRtt) / 1_000_000_000L;
         long targetWindow = Math.max(congestionWindow, bdp);
         
-        // Pacing rate = (window / RTT) * gain - higher gain for WAN
-        double pacingGain = (state == CongestionState.RECOVERY) ? 1.0 : 1.5; // Dynamic gain
+        // Pacing rate = (window / RTT) * gain
+        double pacingGain = (state == CongestionState.RECOVERY) ? 1.0 : 1.25;
         pacingRate = (long)((targetWindow * 1_000_000_000L * pacingGain) / smoothedRtt);
-        pacingRate = Math.min(pacingRate, estimatedBandwidthBps * 3); // Max 3x bandwidth (was 2x)
+        pacingRate = Math.min(pacingRate, estimatedBandwidthBps * 2);
         
-        // Faster packet intervals for WAN
+        // Mikro-pacing interval hesapla
         if (pacingRate > 0) {
             packetIntervalNs = (PACKET_SIZE * 1_000_000_000L) / pacingRate;
-            packetIntervalNs = Math.max(packetIntervalNs, 250); // 250ns minimum (was 500ns)
+            
+            // LAN vs WAN için farklı minimumlar
+            long minInterval = isLocalNetwork ? 20_000 : 1_000; // 20μs LAN, 1μs WAN
+            packetIntervalNs = Math.max(packetIntervalNs, minInterval);
         } else {
-            packetIntervalNs = 1000; // 1μs default for WAN
+            packetIntervalNs = isLocalNetwork ? 20_000 : 10_000;
         }
     }
     
     /**
-     * Network mode configuration
+     * Network mode configuration - LAN optimized for NACK-based protocol
      */
     public void enableLocalNetworkMode() {
         isLocalNetwork = true;
-        // BALANCED LOCAL MODE - Not too aggressive to avoid packet loss
-        maxCongestionWindow = 128 * PACKET_SIZE;  // 128 packets max (was 2048!)  
-        congestionWindow = 16 * PACKET_SIZE;      // 16 packets start (was 512!)
-        slowStartThreshold = 64 * PACKET_SIZE;    // Exit slow start early
-        estimatedBandwidthBps = 100_000_000;      // 100 Mbps conservative estimate
-        smoothedRtt = 2_000_000; // 2ms realistic LAN RTT
-        packetIntervalNs = 500;  // 500ns minimal pacing (not 0!)
-        System.out.println("⚡ LOCAL NETWORK MODE - Ultra aggressive, no rate limiting");
+        // LAN mode - büyük pencere, mikro-pacing
+        maxCongestionWindow = 512 * PACKET_SIZE;  // 512 packets = 742KB max
+        congestionWindow = 128 * PACKET_SIZE;     // 128 packets = 185KB start
+        slowStartThreshold = 256 * PACKET_SIZE;   // 256 packets threshold
+        estimatedBandwidthBps = 500_000_000;      // 500 Mbps başlangıç
+        smoothedRtt = 2_000_000;                  // 2ms realistic LAN RTT
+        packetIntervalNs = 20_000;                // 20μs mikro-pacing
+        updatePacingRate();
+        System.out.println("⚡ LAN MODE: mikro-pacing (20μs), large cwnd (512 pkts)");
     }
     
     public void enableWanMode() {
@@ -316,7 +332,7 @@ public class HybridCongestionController {
     }
     
     public boolean canSendPacket(int packetSize) {
-        if (isLocalNetwork) return true;
+        // NACK-based: congestion window check
         return bytesInFlight.get() + packetSize <= congestionWindow;
     }
     
@@ -337,7 +353,8 @@ public class HybridCongestionController {
         minRtt = Long.MAX_VALUE;
         estimatedBandwidthBps = 10_000_000;
         startTime = System.nanoTime();
-        lastStatsTime = startTime;
+        deliveryRateStartTime = startTime;
+        deliveredBytes.set(0);
         updatePacingRate();
     }
     
