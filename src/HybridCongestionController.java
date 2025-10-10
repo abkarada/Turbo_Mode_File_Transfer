@@ -105,49 +105,39 @@ public class HybridCongestionController {
     }
     
 	/**
-	 * NACK-based implicit acknowledgment - paket mask'te 1 = alınmış (ACK)
-	 * @param ackedPacketCount Kaç paket onaylandı
+	 * NACK-based bandwidth tracking - sadece delivery rate için
+	 * In-flight tracking yapma, sadece bandwidth estimate
 	 */
-	public void onNackImplicitAck(int ackedPacketCount) {
-		if (ackedPacketCount <= 0) return;
-		
-		int ackedBytes = ackedPacketCount * PACKET_SIZE;
-		
-		// In-flight tracking - doğru paket sayısı
-		long currentInFlight = bytesInFlight.get();
-		long currentPackets = packetsInFlight.get();
-		
-		if (currentInFlight >= ackedBytes) {
-			bytesInFlight.addAndGet(-ackedBytes);
+	public void onNackFrameReceived(int receivedPacketCount, int lostPacketCount) {
+		if (receivedPacketCount > 0) {
+			// Delivery rate tracking - sadece bandwidth için
+			int deliveredBytes = receivedPacketCount * PACKET_SIZE;
+			this.deliveredBytes.addAndGet(deliveredBytes);
+			
+			long now = System.nanoTime();
+			updateBandwidthEstimate(now);
 		}
 		
-		if (currentPackets >= ackedPacketCount) {
-			packetsInFlight.addAndGet(-ackedPacketCount);
-		}
-		
-		// Delivery rate tracking - birikimli
-		deliveredBytes.addAndGet(ackedBytes);
-		long now = System.nanoTime();
-		
-		// Bandwidth estimation güncelle
-		updateBandwidthEstimate(now);
-		
-		// Congestion window büyüt - Reno-style additive increase
-		if (state == CongestionState.SLOW_START) {
-			// Exponential growth: her ACK için cwnd += ackedBytes
-			congestionWindow += ackedBytes;
-			if (congestionWindow >= slowStartThreshold) {
-				state = CongestionState.CONGESTION_AVOIDANCE;
-				System.out.println("🔄 Switched to CONGESTION_AVOIDANCE");
+		// Congestion window büyüt - SADECE loss yoksa
+		if (lostPacketCount == 0 && receivedPacketCount > 0) {
+			int ackedBytes = receivedPacketCount * PACKET_SIZE;
+			
+			if (state == CongestionState.SLOW_START) {
+				// Exponential growth
+				congestionWindow += ackedBytes;
+				if (congestionWindow >= slowStartThreshold) {
+					state = CongestionState.CONGESTION_AVOIDANCE;
+					System.out.println("🔄 Switched to CONGESTION_AVOIDANCE");
+				}
+			} else if (state == CongestionState.CONGESTION_AVOIDANCE) {
+				// Additive increase
+				long increase = (PACKET_SIZE * PACKET_SIZE) / congestionWindow;
+				congestionWindow += Math.max(1, increase * receivedPacketCount);
 			}
-		} else if (state == CongestionState.CONGESTION_AVOIDANCE) {
-			// Additive increase: cwnd += MSS * MSS / cwnd per ACK
-			long increase = (PACKET_SIZE * PACKET_SIZE) / congestionWindow;
-			congestionWindow += Math.max(1, increase * ackedPacketCount);
+			
+			congestionWindow = Math.min(congestionWindow, maxCongestionWindow);
+			updatePacingRate();
 		}
-		
-		congestionWindow = Math.min(congestionWindow, maxCongestionWindow);
-		updatePacingRate();
 	}
     
     /**
@@ -161,14 +151,9 @@ public class HybridCongestionController {
 		if (lostPacketCount <= 0) return;
 		
 		totalLossCount.addAndGet(lostPacketCount);
-		// In-flight düzeltmesi - negatif olmasın
-		long currentInFlight = bytesInFlight.get();
-		long currentPackets = packetsInFlight.get();
-		
-		bytesInFlight.set(Math.max(0, currentInFlight - lostBytes));
-		packetsInFlight.set(Math.max(0, currentPackets - lostPacketCount));        lastNackTime = System.nanoTime();
+		lastNackTime = System.nanoTime();
         
-        // QUIC-style congestion response - gentler for WAN
+        // NACK-based congestion response - sadece ilk loss'ta
         if (state != CongestionState.RECOVERY) {
             state = CongestionState.RECOVERY;
             
@@ -180,9 +165,9 @@ public class HybridCongestionController {
                 estimatedBandwidthBps = (long)(estimatedBandwidthBps * 0.9); // 10% reduction
             } else {
                 // WAN - gentler backoff for better recovery
-                slowStartThreshold = (congestionWindow * 3) / 4;  // 75% threshold (was 50%)
-                congestionWindow = Math.max(slowStartThreshold, 8 * PACKET_SIZE); // Min 8 packets (was 4)
-                estimatedBandwidthBps = (long)(estimatedBandwidthBps * 0.8); // 20% reduction (was 50%)
+                slowStartThreshold = (congestionWindow * 3) / 4;  // 75% threshold
+                congestionWindow = Math.max(slowStartThreshold, 8 * PACKET_SIZE); // Min 8 packets
+                estimatedBandwidthBps = (long)(estimatedBandwidthBps * 0.8); // 20% reduction
             }
             
             updatePacingRate();
@@ -299,7 +284,7 @@ public class HybridCongestionController {
     }
     
     /**
-     * Current statistics
+     * Current statistics - simplified for NACK-based
      */
     public String getStats() {
         long now = System.nanoTime();
@@ -313,12 +298,11 @@ public class HybridCongestionController {
         
         return String.format(
             "State: %s, CWnd: %d pkts, BW: %.1f Mbps, RTT: %.1fms, " +
-            "InFlight: %d pkts, Loss: %.2f%%, Throughput: %.1f Mbps",
+            "Loss: %.2f%%, Throughput: %.1f Mbps",
             state,
             congestionWindow / PACKET_SIZE,
             estimatedBandwidthBps / 1_000_000.0,
             smoothedRtt / 1_000_000.0,
-            packetsInFlight.get(),
             lossRate,
             throughputMbps
         );
@@ -332,8 +316,9 @@ public class HybridCongestionController {
     }
     
     public boolean canSendPacket(int packetSize) {
-        // NACK-based: congestion window check
-        return bytesInFlight.get() + packetSize <= congestionWindow;
+        // Basitleştirilmiş: sadece congestion window check
+        // In-flight tracking NACK-based protokolde zor, sadece window limiti
+        return true; // Her zaman gönder, pacing kontrol eder
     }
     
     /**
